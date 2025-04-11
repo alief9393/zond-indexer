@@ -1,22 +1,25 @@
 package main
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Migrate applies the database schema migrations.
-func Migrate(db *sql.DB) error {
+func Migrate(db *pgxpool.Pool) error {
 	// Start a transaction for the migration
-	tx, err := db.Begin()
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(ctx)
 
-	// Create the type_address domain for Ethereum/Zond addresses (20 bytes)
+	// Check if the type_address domain exists
 	var domainExists bool
-	err = tx.QueryRow(`
+	err = tx.QueryRow(ctx, `
         SELECT EXISTS (
             SELECT 1
             FROM pg_type t
@@ -30,7 +33,7 @@ func Migrate(db *sql.DB) error {
 
 	// Create the type_address domain if it doesn't exist
 	if !domainExists {
-		_, err = tx.Exec(`
+		_, err = tx.Exec(ctx, `
             CREATE DOMAIN type_address AS BYTEA
             CHECK (octet_length(VALUE) = 20);
         `)
@@ -39,13 +42,13 @@ func Migrate(db *sql.DB) error {
 		}
 	}
 
-	// Create Blocks table
-	_, err = tx.Exec(`
+	// Create Blocks table with address fields as type_address
+	_, err = tx.Exec(ctx, `
         CREATE TABLE IF NOT EXISTS Blocks (
             block_number BIGINT PRIMARY KEY,
             block_hash BYTEA NOT NULL,
             timestamp TIMESTAMP NOT NULL,
-            miner_address BYTEA NOT NULL,
+            miner_address type_address NOT NULL,
             parent_hash BYTEA NOT NULL,
             gas_used BIGINT NOT NULL,
             gas_limit BIGINT NOT NULL,
@@ -65,13 +68,13 @@ func Migrate(db *sql.DB) error {
 		return fmt.Errorf("create Blocks table: %w", err)
 	}
 
-	// Create Transactions table
-	_, err = tx.Exec(`
+	// Create Transactions table with from_address and to_address as type_address
+	_, err = tx.Exec(ctx, `
         CREATE TABLE IF NOT EXISTS Transactions (
             tx_hash BYTEA PRIMARY KEY,
             block_number BIGINT NOT NULL REFERENCES Blocks(block_number),
-            from_address BYTEA NOT NULL,
-            to_address BYTEA,
+            from_address type_address NOT NULL,
+            to_address type_address,
             value TEXT NOT NULL,
             gas BIGINT NOT NULL,
             gas_price TEXT NOT NULL,
@@ -90,10 +93,10 @@ func Migrate(db *sql.DB) error {
 		return fmt.Errorf("create Transactions table: %w", err)
 	}
 
-	// Create Accounts table
-	_, err = tx.Exec(`
+	// Create Accounts table with address as type_address
+	_, err = tx.Exec(ctx, `
         CREATE TABLE IF NOT EXISTS Accounts (
-            address BYTEA PRIMARY KEY,
+            address type_address PRIMARY KEY,
             balance TEXT NOT NULL,
             nonce INTEGER NOT NULL,
             is_contract BOOLEAN NOT NULL,
@@ -107,10 +110,10 @@ func Migrate(db *sql.DB) error {
 		return fmt.Errorf("create Accounts table: %w", err)
 	}
 
-	// Create Contracts table
-	_, err = tx.Exec(`
+	// Create Contracts table with address as type_address
+	_, err = tx.Exec(ctx, `
         CREATE TABLE IF NOT EXISTS Contracts (
-            address BYTEA PRIMARY KEY REFERENCES Accounts(address),
+            address type_address PRIMARY KEY REFERENCES Accounts(address),
             contract_name VARCHAR(255) NOT NULL,
             compiler_version VARCHAR(50) NOT NULL,
             abi JSON NOT NULL,
@@ -130,10 +133,10 @@ func Migrate(db *sql.DB) error {
 		return fmt.Errorf("create Contracts table: %w", err)
 	}
 
-	// Create Tokens table
-	_, err = tx.Exec(`
+	// Create Tokens table with contract_address as type_address
+	_, err = tx.Exec(ctx, `
         CREATE TABLE IF NOT EXISTS Tokens (
-            contract_address BYTEA PRIMARY KEY REFERENCES Accounts(address),
+            contract_address type_address PRIMARY KEY REFERENCES Accounts(address),
             token_name VARCHAR(255) NOT NULL,
             token_symbol VARCHAR(50) NOT NULL,
             total_supply BIGINT CHECK (total_supply >= 0) NOT NULL,
@@ -151,13 +154,13 @@ func Migrate(db *sql.DB) error {
 		return fmt.Errorf("create Tokens table: %w", err)
 	}
 
-	// Create TokenTransactions table
-	_, err = tx.Exec(`
+	// Create TokenTransactions table with addresses as type_address
+	_, err = tx.Exec(ctx, `
         CREATE TABLE IF NOT EXISTS TokenTransactions (
             tx_hash BYTEA NOT NULL REFERENCES Transactions(tx_hash),
-            contract_address BYTEA NOT NULL REFERENCES Tokens(contract_address),
-            from_address BYTEA NOT NULL REFERENCES Accounts(address),
-            to_address BYTEA NOT NULL REFERENCES Accounts(address),
+            contract_address type_address NOT NULL REFERENCES Tokens(contract_address),
+            from_address type_address NOT NULL REFERENCES Accounts(address),
+            to_address type_address NOT NULL REFERENCES Accounts(address),
             token_id VARCHAR(255),
             value BIGINT CHECK (value >= 0) NOT NULL,
             PRIMARY KEY (tx_hash, contract_address, from_address, to_address, token_id),
@@ -171,13 +174,13 @@ func Migrate(db *sql.DB) error {
 		return fmt.Errorf("create TokenTransactions table: %w", err)
 	}
 
-	// Create NFTs table
-	_, err = tx.Exec(`
+	// Create NFTs table with addresses as type_address
+	_, err = tx.Exec(ctx, `
         CREATE TABLE IF NOT EXISTS NFTs (
-            contract_address BYTEA NOT NULL REFERENCES Accounts(address),
+            contract_address type_address NOT NULL REFERENCES Accounts(address),
             token_id VARCHAR(255) NOT NULL,
             token_uri VARCHAR(255) NOT NULL,
-            owner BYTEA NOT NULL REFERENCES Accounts(address),
+            owner type_address NOT NULL REFERENCES Accounts(address),
             metadata JSON,
             PRIMARY KEY (contract_address, token_id),
             is_canonical BOOLEAN DEFAULT TRUE,
@@ -191,9 +194,7 @@ func Migrate(db *sql.DB) error {
 	}
 
 	// Create Validators table
-	// Note: This schema is based on Ethereum's validator data and may need adjustment
-	// for Zond's consensus mechanism, which might differ (e.g., PoS, PoA, or custom).
-	_, err = tx.Exec(`
+	_, err = tx.Exec(ctx, `
         CREATE TABLE IF NOT EXISTS Validators (
             validator_index INT PRIMARY KEY,
             public_key BYTEA NOT NULL,
@@ -211,7 +212,7 @@ func Migrate(db *sql.DB) error {
 	}
 
 	// Create GasPrices table
-	_, err = tx.Exec(`
+	_, err = tx.Exec(ctx, `
         CREATE TABLE IF NOT EXISTS GasPrices (
             timestamp TIMESTAMP NOT NULL,
             low_price BIGINT CHECK (low_price >= 0) NOT NULL,
@@ -228,8 +229,8 @@ func Migrate(db *sql.DB) error {
 		return fmt.Errorf("create GasPrices table: %w", err)
 	}
 
-	// Create ZondNodes table (renamed from EthereumNodes)
-	_, err = tx.Exec(`
+	// Create ZondNodes table
+	_, err = tx.Exec(ctx, `
         CREATE TABLE IF NOT EXISTS ZondNodes (
             node_id VARCHAR(255) PRIMARY KEY,
             version VARCHAR(50) NOT NULL,
@@ -247,7 +248,7 @@ func Migrate(db *sql.DB) error {
 	}
 
 	// Commit the transaction
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit transaction: %w", err)
 	}
 

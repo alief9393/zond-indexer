@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"flag"
 	"fmt"
 	"log"
@@ -12,11 +11,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/theQRL/go-zond/core/types"
 	"github.com/theQRL/go-zond/rpc"
 	"github.com/theQRL/go-zond/zondclient"
-
-	_ "github.com/lib/pq"
 )
 
 // Indexer holds the state for indexing Zond blocks
@@ -24,7 +22,7 @@ type Indexer struct {
 	config     Config
 	client     *zondclient.Client
 	rpcClient  *rpc.Client
-	db         *sql.DB
+	db         *pgxpool.Pool // Updated to use pgxpool.Pool
 	chainID    *big.Int
 	rateLimit  time.Duration
 	latest     uint64
@@ -36,26 +34,38 @@ func NewIndexer(config Config) (*Indexer, error) {
 	// Connect to the Zond node
 	rpcClient, err := rpc.Dial(config.RPCEndpoint)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to connect to RPC endpoint: %w", err)
 	}
 	client := zondclient.NewClient(rpcClient)
 
 	// Fetch the chain ID
 	chainID, err := client.ChainID(context.Background())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch chain ID: %w", err)
 	}
 
-	// Connect to the database
-	db, err := sql.Open("postgres", config.PostgresConn)
+	// Connect to the database using pgxpool
+	dbConfig, err := pgxpool.ParseConfig(config.PostgresConn)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse Postgres connection string: %w", err)
+	}
+	db, err := pgxpool.NewWithConfig(context.Background(), dbConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	// Test the database connection
+	err = db.Ping(context.Background())
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
 	// Fetch the latest block number
 	latest, err := client.BlockNumber(context.Background())
 	if err != nil {
-		return nil, err
+		db.Close()
+		return nil, fmt.Errorf("failed to fetch latest block number: %w", err)
 	}
 
 	return &Indexer{
@@ -78,13 +88,25 @@ func (i *Indexer) Run(ctx context.Context) error {
 	flag.Parse()
 
 	if dropDB {
-		_, err := i.db.Exec("DROP DATABASE IF EXISTS zond_indexer_db")
+		// Connect to the default database (e.g., "postgres") to drop and create the target database
+		defaultConnStr := "host=" + i.config.PostgresHost + " port=" + i.config.PostgresPort + " user=" + i.config.PostgresUser + " dbname=postgres password=" + i.config.PostgresPassword + " sslmode=disable"
+		defaultDBConfig, err := pgxpool.ParseConfig(defaultConnStr)
+		if err != nil {
+			return fmt.Errorf("failed to parse default Postgres connection string: %w", err)
+		}
+		defaultDB, err := pgxpool.NewWithConfig(context.Background(), defaultDBConfig)
+		if err != nil {
+			return fmt.Errorf("failed to connect to default database: %w", err)
+		}
+		defer defaultDB.Close()
+
+		_, err = defaultDB.Exec(context.Background(), "DROP DATABASE IF EXISTS zond_indexer_db")
 		if err != nil {
 			return fmt.Errorf("failed to drop database: %w", err)
 		}
 		log.Println("Dropped database zond_indexer_db")
 
-		_, err = i.db.Exec("CREATE DATABASE zond_indexer_db")
+		_, err = defaultDB.Exec(context.Background(), "CREATE DATABASE zond_indexer_db")
 		if err != nil {
 			return fmt.Errorf("failed to create database: %w", err)
 		}
@@ -93,7 +115,11 @@ func (i *Indexer) Run(ctx context.Context) error {
 		// Reconnect to the new database
 		i.db.Close()
 		newConnStr := "host=" + i.config.PostgresHost + " port=" + i.config.PostgresPort + " user=" + i.config.PostgresUser + " dbname=zond_indexer_db password=" + i.config.PostgresPassword + " sslmode=disable"
-		i.db, err = sql.Open("postgres", newConnStr)
+		dbConfig, err := pgxpool.ParseConfig(newConnStr)
+		if err != nil {
+			return fmt.Errorf("failed to parse new Postgres connection string: %w", err)
+		}
+		i.db, err = pgxpool.NewWithConfig(context.Background(), dbConfig)
 		if err != nil {
 			return fmt.Errorf("failed to reconnect to database: %w", err)
 		}

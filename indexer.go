@@ -2,37 +2,35 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math/big"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/theQRL/go-zond/accounts/abi"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/theQRL/go-zond/common"
-	"github.com/theQRL/go-zond/common/hexutil"
 	"github.com/theQRL/go-zond/core/types"
 	"github.com/theQRL/go-zond/rpc"
 	"github.com/theQRL/go-zond/zondclient"
 )
 
 // indexBlock processes a single block and indexes its data into the database.
-func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.Client, db *sql.DB, blockNum uint64, chainID *big.Int) error {
+func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.Client, db *pgxpool.Pool, blockNum uint64, chainID *big.Int) error {
 	block, err := client.BlockByNumber(ctx, big.NewInt(int64(blockNum)))
 	if err != nil {
 		return fmt.Errorf("fetch block %d: %w", blockNum, err)
 	}
 
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(ctx)
 
 	// Insert Block
 	var baseFeePerGas *int64
@@ -48,6 +46,42 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 	gasUsedStr := strconv.FormatUint(block.GasUsed(), 10)
 	gasLimitStr := strconv.FormatUint(block.GasLimit(), 10)
 
+	// Validate miner address
+	minerAddrBytes := block.Coinbase().Bytes()
+	if len(minerAddrBytes) != 20 {
+		return fmt.Errorf("block %d: invalid miner address length: got %d bytes, expected 20", blockNum, len(minerAddrBytes))
+	}
+	// Additional validation: ensure the hex representation is valid
+	minerAddrHex := block.Coinbase().Hex()
+	if !isValidHexAddress(minerAddrHex) {
+		return fmt.Errorf("block %d: invalid miner address format: %s", blockNum, minerAddrHex)
+	}
+	// Log the miner address bytes to check for invalid bytes like 0x89
+	log.Printf("Block %d: Miner address bytes: %v", blockNum, minerAddrBytes)
+
+	// Validate BYTEA fields and log their hex representation for debugging
+	blockHashBytes := block.Hash().Bytes()
+	parentHashBytes := block.ParentHash().Bytes()
+	extraDataBytes := block.Extra()
+	// Log extra_data as hex for debugging, but store as BYTEA
+	extraDataHex := "0x" + hex.EncodeToString(extraDataBytes)
+	txRootBytes := block.TxHash().Bytes()
+	stateRootBytes := block.Root().Bytes()
+	receiptsRootBytes := block.ReceiptHash().Bytes()
+	logsBloomBytes := block.Bloom().Bytes()
+
+	// Log all BYTEA fields as hex strings to debug
+	log.Printf("Block %d: block_hash=%s, miner_address=%s, parent_hash=%s, extra_data=%s, transactions_root=%s, state_root=%s, receipts_root=%s, logs_bloom=%s",
+		blockNum,
+		hex.EncodeToString(blockHashBytes),
+		hex.EncodeToString(minerAddrBytes),
+		hex.EncodeToString(parentHashBytes),
+		extraDataHex,
+		hex.EncodeToString(txRootBytes),
+		hex.EncodeToString(stateRootBytes),
+		hex.EncodeToString(receiptsRootBytes),
+		hex.EncodeToString(logsBloomBytes))
+
 	// Log the values being inserted for debugging
 	log.Printf("Inserting block %d: gas_used=%s, gas_limit=%s, base_fee_per_gas=%v, retrieved_from=%s",
 		block.Number().Int64(),
@@ -55,7 +89,9 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 		gasLimitStr,
 		baseFeePerGas,
 		"zond_node")
-	_, err = tx.ExecContext(ctx,
+
+	// Insert all fields in a single statement
+	_, err = tx.Exec(ctx,
 		`INSERT INTO Blocks (
             block_number, block_hash, timestamp, miner_address, parent_hash,
             gas_used, gas_limit, size, transaction_count, extra_data,
@@ -64,20 +100,20 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
         ON CONFLICT (block_number) DO NOTHING`,
 		block.Number().Int64(),
-		block.Hash().Bytes(),
+		blockHashBytes,
 		time.Unix(int64(block.Time()), 0),
-		block.Coinbase().Bytes(),
-		block.ParentHash().Bytes(),
+		minerAddrBytes,
+		parentHashBytes,
 		gasUsedStr,
 		gasLimitStr,
 		int(block.Size()),
 		len(block.Transactions()),
-		block.Extra(),
-		baseFeePerGas, // Now a BIGINT
-		block.TxHash().Bytes(),
-		block.Root().Bytes(),
-		block.ReceiptHash().Bytes(),
-		block.Bloom().Bytes(),
+		extraDataBytes,
+		baseFeePerGas,
+		txRootBytes,
+		stateRootBytes,
+		receiptsRootBytes,
+		logsBloomBytes,
 		chainID.Int64(),
 		"zond_node")
 	if err != nil {
@@ -96,7 +132,7 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 	if isValidHexAddress(minerAddr) {
 		accounts[minerAddr] = true
 	} else {
-		log.Printf("Block %d: Skipping invalid miner address: %s", blockNum, minerAddr)
+		return fmt.Errorf("block %d: invalid miner address format: %s", blockNum, minerAddr)
 	}
 
 	// Calculate Gas Prices for the block
@@ -127,10 +163,19 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 			return fmt.Errorf("get sender for tx %s: %w", transaction.Hash().Hex(), err)
 		}
 
+		// Validate from address
+		fromAddrBytes := from.Bytes()
+		if len(fromAddrBytes) != 20 {
+			return fmt.Errorf("tx %s: invalid from address length: got %d bytes, expected 20", transaction.Hash().Hex(), len(fromAddrBytes))
+		}
+
 		var toAddress []byte
 		var toAddrStr string
 		if to := transaction.To(); to != nil {
 			toAddress = to.Bytes()
+			if len(toAddress) != 20 {
+				return fmt.Errorf("tx %s: invalid to address length: got %d bytes, expected 20", transaction.Hash().Hex(), len(toAddress))
+			}
 			toAddrStr = to.Hex()
 		}
 
@@ -156,7 +201,7 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 			accessList = json.RawMessage("[]")
 		}
 
-		_, err = tx.ExecContext(ctx,
+		_, err = tx.Exec(ctx,
 			`INSERT INTO Transactions (
                 tx_hash, block_number, from_address, to_address, value, gas,
                 gas_price, type, chain_id, access_list, max_fee_per_gas,
@@ -166,7 +211,7 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
             ON CONFLICT (tx_hash) DO NOTHING`,
 			transaction.Hash().Bytes(),
 			block.Number().Int64(),
-			from.Bytes(),
+			fromAddrBytes,
 			toAddress,
 			transaction.Value().String(),
 			int64(transaction.Gas()),
@@ -190,7 +235,7 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 		if isValidHexAddress(fromAddr) {
 			accounts[fromAddr] = true
 		} else {
-			log.Printf("Block %d: Skipping invalid from address: %s", blockNum, fromAddr)
+			return fmt.Errorf("block %d: invalid from address format: %s", blockNum, fromAddr)
 		}
 
 		if toAddrStr != "" {
@@ -198,13 +243,17 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 			if isValidHexAddress(toAddrStr) {
 				accounts[toAddrStr] = true
 			} else {
-				log.Printf("Block %d: Skipping invalid to address: %s", blockNum, toAddrStr)
+				return fmt.Errorf("block %d: invalid to address format: %s", blockNum, toAddrStr)
 			}
 		}
 
 		// Handle contract creation
 		if receipt.ContractAddress != (common.Address{}) {
 			contractAddr := receipt.ContractAddress
+			contractAddrBytes := contractAddr.Bytes()
+			if len(contractAddrBytes) != 20 {
+				return fmt.Errorf("tx %s: invalid contract address length: got %d bytes, expected 20", transaction.Hash().Hex(), len(contractAddrBytes))
+			}
 			contractAddrStr := contractAddr.Hex()
 			log.Printf("Block %d: Transaction %s: Contract address: %s", blockNum, transaction.Hash().Hex(), contractAddrStr)
 			if isValidHexAddress(contractAddrStr) {
@@ -223,7 +272,7 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 					}
 				}
 			} else {
-				log.Printf("Block %d: Skipping invalid contract address: %s", blockNum, contractAddrStr)
+				return fmt.Errorf("block %d: invalid contract address format: %s", blockNum, contractAddrStr)
 			}
 		}
 
@@ -241,6 +290,11 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 			return fmt.Errorf("convert address %s: %w", address, err)
 		}
 
+		addrBytes := addr.Bytes()
+		if len(addrBytes) != 20 {
+			return fmt.Errorf("account %s: invalid address length: got %d bytes, expected 20", address, len(addrBytes))
+		}
+
 		balance, err := client.BalanceAt(ctx, addr, block.Number())
 		if err != nil {
 			return fmt.Errorf("fetch balance for %s: %w", address, err)
@@ -256,23 +310,23 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 
 		var existingBalance string
 		var existingNonce int
-		err = tx.QueryRowContext(ctx,
+		err = tx.QueryRow(ctx,
 			`SELECT balance, nonce FROM Accounts WHERE address = $1`,
-			addr.Bytes()).Scan(&existingBalance, &existingNonce)
-		if err != nil && err != sql.ErrNoRows {
+			addrBytes).Scan(&existingBalance, &existingNonce)
+		if err != nil && err != pgx.ErrNoRows {
 			return fmt.Errorf("check existing account %s: %w", address, err)
 		}
 
 		balanceStr := balance.String()
 		nonceInt := int(nonce)
-		if err == sql.ErrNoRows || existingBalance != balanceStr || existingNonce != nonceInt {
-			_, err = tx.ExecContext(ctx,
+		if err == pgx.ErrNoRows || existingBalance != balanceStr || existingNonce != nonceInt {
+			_, err = tx.Exec(ctx,
 				`INSERT INTO Accounts (
                     address, balance, nonce, is_contract, code, first_seen, last_seen, retrieved_from
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 ON CONFLICT (address) DO UPDATE
                 SET balance = $2, nonce = $3, last_seen = $7`,
-				addr.Bytes(),
+				addrBytes,
 				balanceStr,
 				nonceInt,
 				len(code) > 0,
@@ -288,14 +342,18 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 
 	// Process Contracts (basic info for now, extend with verification API later)
 	for contractAddr := range contracts {
-		_, err := tx.ExecContext(ctx,
+		contractAddrBytes := contractAddr.Bytes()
+		if len(contractAddrBytes) != 20 {
+			return fmt.Errorf("contract %s: invalid address length: got %d bytes, expected 20", contractAddr.Hex(), len(contractAddrBytes))
+		}
+		_, err := tx.Exec(ctx,
 			`INSERT INTO Contracts (
                 address, contract_name, compiler_version, abi, source_code,
                 optimization_enabled, runs, constructor_arguments, verified_date,
                 license, is_canonical, retrieved_at, retrieved_from
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             ON CONFLICT (address) DO NOTHING`,
-			contractAddr.Bytes(),
+			contractAddrBytes,
 			"Unknown",
 			"Unknown",
 			"[]",
@@ -327,7 +385,7 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit transaction: %w", err)
 	}
 
@@ -336,9 +394,7 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 	return nil
 }
 
-// Helper Functions
-
-// isValidHexAddress checks if an address is a valid 40-character hex string (with or without 0x prefix)
+// isValidHexAddress checks if an address is a valid 40-character hex string (with Z or 0x prefix)
 func isValidHexAddress(addr string) bool {
 	// Check for Z prefix
 	if !strings.HasPrefix(addr, "Z") {
@@ -394,355 +450,4 @@ func hexToAddress(s string) (common.Address, error) {
 	var addr common.Address
 	copy(addr[:], bytes)
 	return addr, nil
-}
-
-// callContractRaw performs a raw zond_call RPC call to the given address with the provided data
-func callContractRaw(ctx context.Context, rpcClient *rpc.Client, addr common.Address, data []byte) ([]byte, error) {
-	var hexResult hexutil.Bytes
-	err := rpcClient.CallContext(ctx, &hexResult, "zond_call", map[string]interface{}{
-		"to":   addr.Hex(),
-		"data": hexutil.Encode(data),
-	}, "latest")
-	if err != nil {
-		return nil, fmt.Errorf("zond_call failed: %w", err)
-	}
-	return hexResult, nil
-}
-
-// detectTokenContract checks if a contract is a token (ERC20, ERC721, ERC1155)
-func detectTokenContract(ctx context.Context, rpcClient *rpc.Client, addr common.Address) (bool, string, error) {
-	// Check for ERC-20 (totalSupply, balanceOf, transfer)
-	erc20ABI, _ := abi.JSON(strings.NewReader(`[{"constant":true,"inputs":[],"name":"totalSupply","outputs":[{"name":"","type":"uint256"}],"type":"function"}]`))
-	result, err := callContractRaw(ctx, rpcClient, addr, erc20ABI.Methods["totalSupply"].ID)
-	if err == nil {
-		return true, "ERC20", nil
-	}
-
-	// Check for ERC-721 (supportsInterface for 0x80ac58cd)
-	erc721InterfaceID := common.HexToHash("0x80ac58cd")
-	supportsInterfaceABI, _ := abi.JSON(strings.NewReader(`[{"constant":true,"inputs":[{"name":"interfaceId","type":"bytes4"}],"name":"supportsInterface","outputs":[{"name":"","type":"bool"}],"type":"function"}]`))
-	data, _ := supportsInterfaceABI.Pack("supportsInterface", erc721InterfaceID)
-	result, err = callContractRaw(ctx, rpcClient, addr, data)
-	if err == nil && len(result) > 0 {
-		var supports bool
-		supportsInterfaceABI.UnpackIntoInterface(&supports, "supportsInterface", result)
-		if supports {
-			return true, "ERC721", nil
-		}
-	}
-
-	// Check for ERC-1155 (supportsInterface for 0xd9b67a26)
-	erc1155InterfaceID := common.HexToHash("0xd9b67a26")
-	data, _ = supportsInterfaceABI.Pack("supportsInterface", erc1155InterfaceID)
-	result, err = callContractRaw(ctx, rpcClient, addr, data)
-	if err == nil && len(result) > 0 {
-		var supports bool
-		supportsInterfaceABI.UnpackIntoInterface(&supports, "supportsInterface", result)
-		if supports {
-			return true, "ERC1155", nil
-		}
-	}
-
-	return false, "", nil
-}
-
-// indexToken fetches token metadata and stores it in the Tokens table
-func indexToken(ctx context.Context, rpcClient *rpc.Client, tx *sql.Tx, addr common.Address, blockNum uint64) error {
-	// ERC-20 ABI for name, symbol, totalSupply, decimals
-	erc20ABI, _ := abi.JSON(strings.NewReader(`[
-        {"constant":true,"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"type":"function"},
-        {"constant":true,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"type":"function"},
-        {"constant":true,"inputs":[],"name":"totalSupply","outputs":[{"name":"","type":"uint256"}],"type":"function"},
-        {"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"}
-    ]`))
-
-	// Fetch name
-	nameData, _ := erc20ABI.Pack("name")
-	nameResult, err := callContractRaw(ctx, rpcClient, addr, nameData)
-	if err != nil {
-		return fmt.Errorf("fetch name for token %s: %w", addr.Hex(), err)
-	}
-	var name string
-	erc20ABI.UnpackIntoInterface(&name, "name", nameResult)
-
-	// Fetch symbol
-	symbolData, _ := erc20ABI.Pack("symbol")
-	symbolResult, err := callContractRaw(ctx, rpcClient, addr, symbolData)
-	if err != nil {
-		return fmt.Errorf("fetch symbol for token %s: %w", addr.Hex(), err)
-	}
-	var symbol string
-	erc20ABI.UnpackIntoInterface(&symbol, "symbol", symbolResult)
-
-	// Fetch totalSupply
-	totalSupplyData, _ := erc20ABI.Pack("totalSupply")
-	totalSupplyResult, err := callContractRaw(ctx, rpcClient, addr, totalSupplyData)
-	if err != nil {
-		return fmt.Errorf("fetch totalSupply for token %s: %w", addr.Hex(), err)
-	}
-	var totalSupply *big.Int
-	erc20ABI.UnpackIntoInterface(&totalSupply, "totalSupply", totalSupplyResult)
-
-	// Fetch decimals
-	decimalsData, _ := erc20ABI.Pack("decimals")
-	decimalsResult, err := callContractRaw(ctx, rpcClient, addr, decimalsData)
-	if err != nil {
-		return fmt.Errorf("fetch decimals for token %s: %w", addr.Hex(), err)
-	}
-	var decimals uint8
-	erc20ABI.UnpackIntoInterface(&decimals, "decimals", decimalsResult)
-
-	// Insert into Tokens table
-	_, err = tx.ExecContext(ctx,
-		`INSERT INTO Tokens (
-            contract_address, token_name, token_symbol, total_supply, decimals,
-            token_type, website, logo, is_canonical, retrieved_at, retrieved_from
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-        ON CONFLICT (contract_address) DO NOTHING`,
-		addr.Bytes(),
-		name,
-		symbol,
-		totalSupply.Int64(),
-		int(decimals),
-		"ERC20",
-		"",
-		"",
-		true,
-		time.Now(),
-		"zond_node")
-	if err != nil {
-		return fmt.Errorf("insert token %s: %w", addr.Hex(), err)
-	}
-
-	return nil
-}
-
-// indexTokenTransactionsAndNFTs processes Transfer events for tokens and NFTs
-func indexTokenTransactionsAndNFTs(ctx context.Context, rpcClient *rpc.Client, tx *sql.Tx, transaction *types.Transaction, receipt *types.Receipt, blockNum uint64) error {
-	transferEventSig := common.HexToHash("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ce") // Transfer event signature
-	transferABI, _ := abi.JSON(strings.NewReader(`[{"anonymous":false,"inputs":[{"indexed":true,"name":"from","type":"address"},{"indexed":true,"name":"to","type":"address"},{"indexed":false,"name":"value","type":"uint256"}],"name":"Transfer","type":"event"}]`))
-	// Note: transferNFTABI might be needed for ERC-1155 events in the future
-
-	for _, logEntry := range receipt.Logs {
-		if len(logEntry.Topics) == 0 || logEntry.Topics[0] != transferEventSig {
-			continue
-		}
-
-		contractAddr := common.BytesToAddress(logEntry.Address.Bytes())
-		isToken, tokenType, err := detectTokenContract(ctx, rpcClient, contractAddr)
-		if err != nil {
-			log.Printf("Failed to detect token type for contract %s: %v", contractAddr.Hex(), err)
-			continue
-		}
-		if !isToken {
-			continue
-		}
-
-		var fromAddr, toAddr common.Address
-		var value *big.Int
-		var tokenID *big.Int
-
-		if tokenType == "ERC20" {
-			// ERC-20 Transfer event
-			if len(logEntry.Topics) != 3 {
-				continue
-			}
-			fromAddr = common.BytesToAddress(logEntry.Topics[1].Bytes())
-			toAddr = common.BytesToAddress(logEntry.Topics[2].Bytes())
-			err = transferABI.UnpackIntoInterface(&struct {
-				Value *big.Int
-			}{Value: value}, "Transfer", logEntry.Data)
-			if err != nil {
-				return fmt.Errorf("unpack ERC-20 Transfer event: %w", err)
-			}
-
-			// Insert into TokenTransactions
-			_, err = tx.ExecContext(ctx,
-				`INSERT INTO TokenTransactions (
-                    tx_hash, contract_address, from_address, to_address, token_id,
-                    value, is_canonical, retrieved_at, retrieved_from
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                ON CONFLICT (tx_hash, contract_address, from_address, to_address, token_id) DO NOTHING`,
-				transaction.Hash().Bytes(),
-				contractAddr.Bytes(),
-				fromAddr.Bytes(),
-				toAddr.Bytes(),
-				nil,
-				value.Int64(),
-				true,
-				time.Now(),
-				"zond_node")
-			if err != nil {
-				return fmt.Errorf("insert token transaction for tx %s: %w", transaction.Hash().Hex(), err)
-			}
-		} else if tokenType == "ERC721" {
-			// ERC-721 Transfer event
-			if len(logEntry.Topics) != 4 {
-				continue
-			}
-			fromAddr = common.BytesToAddress(logEntry.Topics[1].Bytes())
-			toAddr = common.BytesToAddress(logEntry.Topics[2].Bytes())
-			tokenID = logEntry.Topics[3].Big()
-
-			// Fetch tokenURI and metadata
-			tokenURI, metadata, err := fetchNFTMetadata(ctx, rpcClient, contractAddr, tokenID)
-			if err != nil {
-				log.Printf("Failed to fetch NFT metadata for contract %s, tokenID %s: %v", contractAddr.Hex(), tokenID.String(), err)
-				continue
-			}
-
-			// Insert into NFTs
-			var metadataJSON []byte
-			if metadata != nil {
-				metadataJSON, err = json.Marshal(metadata)
-				if err != nil {
-					return fmt.Errorf("marshal NFT metadata: %w", err)
-				}
-			}
-			_, err = tx.ExecContext(ctx,
-				`INSERT INTO NFTs (
-                    contract_address, token_id, token_uri, owner, metadata,
-                    is_canonical, retrieved_at, retrieved_from
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                ON CONFLICT (contract_address, token_id) DO UPDATE
-                SET owner = $4, token_uri = $3, metadata = $5`,
-				contractAddr.Bytes(),
-				tokenID.String(),
-				tokenURI,
-				toAddr.Bytes(),
-				metadataJSON,
-				true,
-				time.Now(),
-				"zond_node")
-			if err != nil {
-				return fmt.Errorf("insert NFT for contract %s, tokenID %s: %w", contractAddr.Hex(), tokenID.String(), err)
-			}
-		}
-	}
-
-	return nil
-}
-
-// fetchNFTMetadata fetches tokenURI and metadata for an NFT
-func fetchNFTMetadata(ctx context.Context, rpcClient *rpc.Client, contractAddr common.Address, tokenID *big.Int) (string, map[string]interface{}, error) {
-	// ERC-721 ABI for tokenURI
-	erc721ABI, _ := abi.JSON(strings.NewReader(`[{"constant":true,"inputs":[{"name":"tokenId","type":"uint256"}],"name":"tokenURI","outputs":[{"name":"","type":"string"}],"type":"function"}]`))
-	data, _ := erc721ABI.Pack("tokenURI", tokenID)
-	result, err := callContractRaw(ctx, rpcClient, contractAddr, data)
-	if err != nil {
-		return "", nil, fmt.Errorf("fetch tokenURI: %w", err)
-	}
-	var tokenURI string
-	erc721ABI.UnpackIntoInterface(&tokenURI, "tokenURI", result)
-
-	// Placeholder for metadata (in a real implementation, fetch from tokenURI if it's a URL)
-	metadata := map[string]interface{}{
-		"name": "NFT #" + tokenID.String(),
-	}
-
-	return tokenURI, metadata, nil
-}
-
-// indexNFTs fetches existing NFTs for a contract (historical data)
-func indexNFTs(ctx context.Context, rpcClient *rpc.Client, tx *sql.Tx, contractAddr common.Address, blockNum uint64) error {
-	// For simplicity, we're only indexing NFTs via Transfer events in indexTokenTransactionsAndNFTs.
-	// To index historical NFTs, you would need to query past Transfer events using a filter,
-	// which requires an Ethereum client with event filtering support.
-	// This is a placeholder for future implementation.
-	return nil
-}
-
-// indexGasPrices calculates gas price statistics for a block
-func indexGasPrices(ctx context.Context, client *zondclient.Client, tx *sql.Tx, block *types.Block, blockNum uint64) error {
-	var gasPrices []*big.Int
-	for _, transaction := range block.Transactions() {
-		gasPrice := transaction.GasPrice()
-		if transaction.Type() >= types.DynamicFeeTxType {
-			gasPrice = transaction.GasFeeCap()
-		}
-		gasPrices = append(gasPrices, gasPrice)
-	}
-
-	if len(gasPrices) == 0 {
-		gasPrices = append(gasPrices, big.NewInt(0))
-	}
-
-	// Sort gas prices to find low, average, high
-	sort.Slice(gasPrices, func(i, j int) bool {
-		return gasPrices[i].Cmp(gasPrices[j]) < 0
-	})
-	lowPrice := gasPrices[0]
-	highPrice := gasPrices[len(gasPrices)-1]
-	var totalPrice big.Int
-	for _, price := range gasPrices {
-		totalPrice.Add(&totalPrice, price)
-	}
-	averagePrice := new(big.Int).Div(&totalPrice, big.NewInt(int64(len(gasPrices))))
-
-	timestamp := time.Unix(int64(block.Time()), 0)
-	_, err := tx.ExecContext(ctx,
-		`INSERT INTO GasPrices (
-            timestamp, low_price, average_price, high_price, block_number,
-            retrieved_at, retrieved_from
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (timestamp, block_number) DO NOTHING`,
-		timestamp,
-		lowPrice.Int64(),
-		averagePrice.Int64(),
-		highPrice.Int64(),
-		blockNum,
-		time.Now(),
-		"zond_node")
-	if err != nil {
-		return fmt.Errorf("insert gas prices: %w", err)
-	}
-
-	return nil
-}
-
-// indexValidators fetches validator data (placeholder)
-func indexValidators(ctx context.Context, client *zondclient.Client, tx *sql.Tx) error {
-	// Zond may not expose validator data via go-zond directly.
-	// This requires a beacon chain client or API.
-	// Placeholder: In a real implementation, you would fetch validator data from a beacon chain API.
-	log.Println("Validator indexing not implemented: requires beacon chain API")
-	return nil
-}
-
-// indexZondNodes fetches node information
-func indexZondNodes(ctx context.Context, client *zondclient.Client, tx *sql.Tx) error {
-	// Skip node version fetching since ClientVersion is not available in go-zond
-	nodeInfo := "unknown"
-
-	// Fetch peer count
-	peerCount, err := client.PeerCount(ctx)
-	if err != nil {
-		return fmt.Errorf("fetch peer count: %w", err)
-	}
-
-	// Placeholder for latency and location
-	latency := 50.0 // Example latency in milliseconds
-	location := "Unknown"
-
-	nodeID := "node-" + nodeInfo // Simplified node ID
-	_, err = tx.ExecContext(ctx,
-		`INSERT INTO ZondNodes (
-            node_id, version, location, last_seen, latency, peers,
-            retrieved_at, retrieved_from
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT (node_id) DO UPDATE
-        SET version = $2, location = $3, last_seen = $4, latency = $5, peers = $6`,
-		nodeID,
-		nodeInfo,
-		location,
-		time.Now(),
-		latency,
-		int(peerCount),
-		time.Now(),
-		"zond_node")
-	if err != nil {
-		return fmt.Errorf("insert ZondNodes: %w", err)
-	}
-
-	return nil
 }
