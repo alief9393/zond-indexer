@@ -1,4 +1,4 @@
-package main
+package indexer
 
 import (
 	"context"
@@ -8,8 +8,13 @@ import (
 	"log"
 	"math/big"
 	"strconv"
-	"strings"
 	"time"
+
+	"ZOND-INDEXER/internal/config"
+	"ZOND-INDEXER/internal/models"
+	"ZOND-INDEXER/internal/node"
+	"ZOND-INDEXER/internal/token"
+	"ZOND-INDEXER/internal/utils"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -19,7 +24,201 @@ import (
 	"github.com/theQRL/go-zond/zondclient"
 )
 
-// indexBlock processes a single block and indexes its data into the database.
+// Indexer holds the state for indexing Zond blocks
+type Indexer struct {
+	config             config.Config
+	client             *zondclient.Client
+	rpcClient          *rpc.Client
+	db                 *pgxpool.Pool
+	chainID            *big.Int
+	rateLimit          time.Duration
+	latest             uint64
+	historical         uint64
+	lastValidatorIndex uint64
+	epochLength        uint64
+}
+
+func NewIndexer(config config.Config) (*Indexer, error) {
+	// Connect to the Zond node
+	rpcClient, err := rpc.Dial(config.RPCEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to RPC endpoint: %w", err)
+	}
+	client := zondclient.NewClient(rpcClient)
+
+	// Fetch the chain ID
+	chainID, err := client.ChainID(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch chain ID: %w", err)
+	}
+
+	// Connect to the database
+	dbConfig, err := pgxpool.ParseConfig(config.PostgresConn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse Postgres connection string: %w", err)
+	}
+	db, err := pgxpool.NewWithConfig(context.Background(), dbConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	// Test the db connection
+	err = db.Ping(context.Background())
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	// Fetch the latest block number
+	latest, err := client.BlockNumber(context.Background())
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to fetch latest block number: %w", err)
+	}
+
+	return &Indexer{
+		config:             config,
+		client:             client,
+		rpcClient:          rpcClient,
+		db:                 db,
+		chainID:            chainID,
+		rateLimit:          config.RateLimit,
+		latest:             latest,
+		historical:         latest,
+		lastValidatorIndex: 0,
+		epochLength:        32,
+	}, nil
+}
+
+func (i *Indexer) Close() {
+	i.db.Close()
+	i.rpcClient.Close()
+}
+
+func (i *Indexer) Config() config.Config {
+	return i.config
+}
+
+func (i *Indexer) Client() *zondclient.Client {
+	return i.client
+}
+
+func (i *Indexer) RPCClient() *rpc.Client {
+	return i.rpcClient
+}
+
+func (i *Indexer) DB() *pgxpool.Pool {
+	return i.db
+}
+
+func (i *Indexer) ChainID() *big.Int {
+	return i.chainID
+}
+
+func (i *Indexer) Latest() uint64 {
+	return i.latest
+}
+
+func (i *Indexer) Historical() uint64 {
+	return i.historical
+}
+
+// indexValidatorsPeriodically indexes validators if the current block is at an epoch boundary
+func (i *Indexer) indexValidatorsPeriodically(ctx context.Context, blockNum uint64) error {
+	// Index validators on startup (block 0) or every epoch
+	if blockNum == 0 || (blockNum > 0 && blockNum%i.epochLength == 0 && blockNum > i.lastValidatorIndex) {
+		tx, err := i.db.Begin(ctx)
+		if err != nil {
+			return fmt.Errorf("begin transaction for validator indexing: %w", err)
+		}
+		defer tx.Rollback(ctx)
+
+		// Pass the Config to IndexValidators
+		if err := models.IndexValidators(ctx, i.client, tx, i.config); err != nil {
+			log.Printf("Failed to index Validators at block %d: %v", blockNum, err)
+			return nil // Not critical, continue indexing blocks
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit transaction for validator indexing: %w", err)
+		}
+
+		i.lastValidatorIndex = blockNum
+		log.Printf("Indexed validators at block %d", blockNum)
+	}
+	return nil
+}
+
+// indexGasPrices calculates gas price for a block
+func indexGasPrices(ctx context.Context, client *zondclient.Client, tx pgx.Tx, block *types.Block, blockNum uint64) error {
+	var gasPrices []*big.Int
+	for _, transaction := range block.Transactions() {
+		gasPrice := transaction.GasPrice()
+		if transaction.Type() >= types.DynamicFeeTxType {
+			gasPrice = transaction.GasFeeCap()
+		}
+		gasPrices = append(gasPrices, gasPrice)
+	}
+
+	if len(gasPrices) == 0 {
+		gasPrices = append(gasPrices, big.NewInt(0))
+	}
+
+	// Sort gas prices to find low, average, high
+	gasPrices = sortGasPrices(gasPrices)
+	lowPrice := gasPrices[0]
+	highPrice := gasPrices[len(gasPrices)-1]
+	averagePrice := calculateAverageGasPrice(gasPrices)
+
+	timestamp := time.Unix(int64(block.Time()), 0)
+	_, err := tx.Exec(ctx,
+		`INSERT INTO GasPrices (
+            timestamp, low_price, average_price, high_price, block_number,
+            retrieved_at, retrieved_from
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (timestamp, block_number) DO NOTHING`,
+		timestamp,
+		lowPrice.Int64(),
+		averagePrice.Int64(),
+		highPrice.Int64(),
+		blockNum,
+		time.Now(),
+		"zond_node")
+	if err != nil {
+		return fmt.Errorf("insert gas prices: %w", err)
+	}
+
+	return nil
+}
+
+// sortGasPrices sorts gas prices in ascending order
+func sortGasPrices(gasPrices []*big.Int) []*big.Int {
+	sorted := make([]*big.Int, len(gasPrices))
+	copy(sorted, gasPrices)
+	sortSlice(sorted, func(i, j int) bool {
+		return sorted[i].Cmp(sorted[j]) < 0
+	})
+	return sorted
+}
+
+// calculateAverageGasPrice calculates the average gas price
+func calculateAverageGasPrice(gasPrices []*big.Int) *big.Int {
+	var totalPrice big.Int
+	for _, price := range gasPrices {
+		totalPrice.Add(&totalPrice, price)
+	}
+	return new(big.Int).Div(&totalPrice, big.NewInt(int64(len(gasPrices))))
+}
+
+func sortSlice[T any](slice []T, less func(i, j int) bool) {
+	for i := 1; i < len(slice); i++ {
+		for j := i; j > 0 && less(j, j-1); j-- {
+			slice[j], slice[j-1] = slice[j-1], slice[j]
+		}
+	}
+}
+
+// indexBlock processes a single block and indexes its data into the db.
 func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.Client, db *pgxpool.Pool, blockNum uint64, chainID *big.Int) error {
 	block, err := client.BlockByNumber(ctx, big.NewInt(int64(blockNum)))
 	if err != nil {
@@ -42,55 +241,26 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 			return fmt.Errorf("base_fee_per_gas for block %d is too large for int64: %s", blockNum, baseFee.String())
 		}
 	}
-	// Convert gas_used and gas_limit to strings safely
 	gasUsedStr := strconv.FormatUint(block.GasUsed(), 10)
 	gasLimitStr := strconv.FormatUint(block.GasLimit(), 10)
 
-	// Validate miner address
 	minerAddrBytes := block.Coinbase().Bytes()
 	if len(minerAddrBytes) != 20 {
 		return fmt.Errorf("block %d: invalid miner address length: got %d bytes, expected 20", blockNum, len(minerAddrBytes))
 	}
-	// Additional validation: ensure the hex representation is valid
 	minerAddrHex := block.Coinbase().Hex()
-	if !isValidHexAddress(minerAddrHex) {
+	if !utils.IsValidHexAddress(minerAddrHex) {
 		return fmt.Errorf("block %d: invalid miner address format: %s", blockNum, minerAddrHex)
 	}
-	// Log the miner address bytes to check for invalid bytes like 0x89
-	log.Printf("Block %d: Miner address bytes: %v", blockNum, minerAddrBytes)
 
-	// Validate BYTEA fields and log their hex representation for debugging
 	blockHashBytes := block.Hash().Bytes()
 	parentHashBytes := block.ParentHash().Bytes()
 	extraDataBytes := block.Extra()
-	// Log extra_data as hex for debugging, but store as BYTEA
-	extraDataHex := "0x" + hex.EncodeToString(extraDataBytes)
 	txRootBytes := block.TxHash().Bytes()
 	stateRootBytes := block.Root().Bytes()
 	receiptsRootBytes := block.ReceiptHash().Bytes()
 	logsBloomBytes := block.Bloom().Bytes()
 
-	// Log all BYTEA fields as hex strings to debug
-	log.Printf("Block %d: block_hash=%s, miner_address=%s, parent_hash=%s, extra_data=%s, transactions_root=%s, state_root=%s, receipts_root=%s, logs_bloom=%s",
-		blockNum,
-		hex.EncodeToString(blockHashBytes),
-		hex.EncodeToString(minerAddrBytes),
-		hex.EncodeToString(parentHashBytes),
-		extraDataHex,
-		hex.EncodeToString(txRootBytes),
-		hex.EncodeToString(stateRootBytes),
-		hex.EncodeToString(receiptsRootBytes),
-		hex.EncodeToString(logsBloomBytes))
-
-	// Log the values being inserted for debugging
-	log.Printf("Inserting block %d: gas_used=%s, gas_limit=%s, base_fee_per_gas=%v, retrieved_from=%s",
-		block.Number().Int64(),
-		gasUsedStr,
-		gasLimitStr,
-		baseFeePerGas,
-		"zond_node")
-
-	// Insert all fields in a single statement
 	_, err = tx.Exec(ctx,
 		`INSERT INTO Blocks (
             block_number, block_hash, timestamp, miner_address, parent_hash,
@@ -122,14 +292,13 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 
 	// Process Transactions and Collect Accounts
 	accounts := make(map[string]bool)
-	contracts := make(map[common.Address]bool)      // Track contract addresses
-	tokenContracts := make(map[common.Address]bool) // Track token contracts
-	nftContracts := make(map[common.Address]bool)   // Track NFT contracts
+	contracts := make(map[common.Address]bool)
+	tokenContracts := make(map[common.Address]bool)
+	nftContracts := make(map[common.Address]bool)
 
 	// Add the miner address
 	minerAddr := block.Coinbase().Hex()
-	log.Printf("Block %d: Miner address: %s", blockNum, minerAddr)
-	if isValidHexAddress(minerAddr) {
+	if utils.IsValidHexAddress(minerAddr) {
 		accounts[minerAddr] = true
 	} else {
 		return fmt.Errorf("block %d: invalid miner address format: %s", blockNum, minerAddr)
@@ -141,14 +310,8 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 	}
 
 	// Process ZondNodes (node info)
-	if err := indexZondNodes(ctx, client, tx); err != nil {
+	if err := node.IndexZondNodes(ctx, client, tx); err != nil {
 		log.Printf("Failed to index ZondNodes for block %d: %v", blockNum, err)
-		// Not critical, so we continue
-	}
-
-	// Process Validators (if supported)
-	if err := indexValidators(ctx, client, tx); err != nil {
-		log.Printf("Failed to index Validators for block %d: %v", blockNum, err)
 		// Not critical, so we continue
 	}
 
@@ -163,7 +326,6 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 			return fmt.Errorf("get sender for tx %s: %w", transaction.Hash().Hex(), err)
 		}
 
-		// Validate from address
 		fromAddrBytes := from.Bytes()
 		if len(fromAddrBytes) != 20 {
 			return fmt.Errorf("tx %s: invalid from address length: got %d bytes, expected 20", transaction.Hash().Hex(), len(fromAddrBytes))
@@ -189,7 +351,6 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 			maxPriorityFeePerGas = &mpfStr
 		}
 
-		// Marshal AccessList to JSON
 		var accessList json.RawMessage
 		if al := transaction.AccessList(); al != nil {
 			accessListBytes, err := json.Marshal(al)
@@ -229,25 +390,21 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 			return fmt.Errorf("insert transaction %s: %w", transaction.Hash().Hex(), err)
 		}
 
-		// Add transaction-related addresses to accounts
 		fromAddr := from.Hex()
-		log.Printf("Block %d: Transaction %s: From address: %s", blockNum, transaction.Hash().Hex(), fromAddr)
-		if isValidHexAddress(fromAddr) {
+		if utils.IsValidHexAddress(fromAddr) {
 			accounts[fromAddr] = true
 		} else {
 			return fmt.Errorf("block %d: invalid from address format: %s", blockNum, fromAddr)
 		}
 
 		if toAddrStr != "" {
-			log.Printf("Block %d: Transaction %s: To address: %s", blockNum, transaction.Hash().Hex(), toAddrStr)
-			if isValidHexAddress(toAddrStr) {
+			if utils.IsValidHexAddress(toAddrStr) {
 				accounts[toAddrStr] = true
 			} else {
 				return fmt.Errorf("block %d: invalid to address format: %s", blockNum, toAddrStr)
 			}
 		}
 
-		// Handle contract creation
 		if receipt.ContractAddress != (common.Address{}) {
 			contractAddr := receipt.ContractAddress
 			contractAddrBytes := contractAddr.Bytes()
@@ -255,13 +412,11 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 				return fmt.Errorf("tx %s: invalid contract address length: got %d bytes, expected 20", transaction.Hash().Hex(), len(contractAddrBytes))
 			}
 			contractAddrStr := contractAddr.Hex()
-			log.Printf("Block %d: Transaction %s: Contract address: %s", blockNum, transaction.Hash().Hex(), contractAddrStr)
-			if isValidHexAddress(contractAddrStr) {
+			if utils.IsValidHexAddress(contractAddrStr) {
 				accounts[contractAddrStr] = true
 				contracts[contractAddr] = true
 
-				// Check if this is a token or NFT contract
-				isToken, tokenType, err := detectTokenContract(ctx, rpcClient, contractAddr)
+				isToken, tokenType, err := token.DetectTokenContract(ctx, rpcClient, contractAddr)
 				if err != nil {
 					log.Printf("Block %d: Failed to detect token type for contract %s: %v", blockNum, contractAddrStr, err)
 				} else if isToken {
@@ -276,23 +431,21 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 			}
 		}
 
-		// Process Token Transactions and NFTs (via Transfer events)
-		if err := indexTokenTransactionsAndNFTs(ctx, rpcClient, tx, transaction, receipt, blockNum); err != nil {
+		if err := token.IndexTokenTransactionsAndNFTs(ctx, rpcClient, tx, transaction, receipt, blockNum); err != nil {
 			return fmt.Errorf("index token transactions and NFTs for tx %s: %w", transaction.Hash().Hex(), err)
 		}
 	}
 
-	// Process Accounts
 	timestamp := time.Unix(int64(block.Time()), 0)
 	for address := range accounts {
-		addr, err := hexToAddress(address)
+		addr, err := utils.HexToAddress(address)
 		if err != nil {
 			return fmt.Errorf("convert address %s: %w", address, err)
 		}
 
 		addrBytes := addr.Bytes()
 		if len(addrBytes) != 20 {
-			return fmt.Errorf("account %s: invalid address length: got %d bytes, expected 20", address, len(addrBytes))
+			return fmt.Errorf("account %s: invalid address length: %d bytes, expected 20", address, len(addrBytes))
 		}
 
 		balance, err := client.BalanceAt(ctx, addr, block.Number())
@@ -340,11 +493,10 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 		}
 	}
 
-	// Process Contracts (basic info for now, extend with verification API later)
 	for contractAddr := range contracts {
 		contractAddrBytes := contractAddr.Bytes()
 		if len(contractAddrBytes) != 20 {
-			return fmt.Errorf("contract %s: invalid address length: got %d bytes, expected 20", contractAddr.Hex(), len(contractAddrBytes))
+			return fmt.Errorf("contract %s: invalid address length: %d bytes, expected 20", contractAddr.Hex(), len(contractAddrBytes))
 		}
 		_, err := tx.Exec(ctx,
 			`INSERT INTO Contracts (
@@ -371,16 +523,14 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 		}
 	}
 
-	// Process Tokens
 	for tokenAddr := range tokenContracts {
-		if err := indexToken(ctx, rpcClient, tx, tokenAddr, blockNum); err != nil {
+		if err := token.IndexToken(ctx, rpcClient, tx, tokenAddr, blockNum); err != nil {
 			return fmt.Errorf("index token %s: %w", tokenAddr.Hex(), err)
 		}
 	}
 
-	// Process NFTs
 	for nftAddr := range nftContracts {
-		if err := indexNFTs(ctx, rpcClient, tx, nftAddr, blockNum); err != nil {
+		if err := token.IndexNFTs(ctx, rpcClient, tx, nftAddr, blockNum); err != nil {
 			return fmt.Errorf("index NFTs for contract %s: %w", nftAddr.Hex(), err)
 		}
 	}
@@ -389,65 +539,76 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 		return fmt.Errorf("commit transaction: %w", err)
 	}
 
-	log.Printf("Indexed block %d with %d transactions, %d accounts, %d contracts, %d tokens, %d NFTs",
-		blockNum, len(block.Transactions()), len(accounts), len(contracts), len(tokenContracts), len(nftContracts))
+	log.Printf("Block %d: Miner=%s, Txs=%d, Accounts=%d", blockNum, minerAddr, len(block.Transactions()), len(accounts))
 	return nil
 }
 
-// isValidHexAddress checks if an address is a valid 40-character hex string (with Z or 0x prefix)
-func isValidHexAddress(addr string) bool {
-	// Check for Z prefix
-	if !strings.HasPrefix(addr, "Z") {
-		// Also allow standard 0x prefix for compatibility
-		if !strings.HasPrefix(addr, "0x") {
-			return false
-		}
-		addr = strings.TrimPrefix(addr, "0x")
-	} else {
-		addr = strings.TrimPrefix(addr, "Z")
-	}
-
-	// Check length (40 characters for 20 bytes)
-	if len(addr) != 40 {
-		return false
-	}
-
-	// Check if all characters are valid hex digits
-	for _, char := range addr {
-		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')) {
-			return false
-		}
-	}
-	return true
-}
-
-// hexToAddress converts a hex string to a common.Address
-func hexToAddress(s string) (common.Address, error) {
-	original := s // For logging
-	// Handle Z prefix for Zond addresses
-	if strings.HasPrefix(s, "Z") {
-		s = strings.TrimPrefix(s, "Z")
-	} else {
-		// Also handle standard 0x prefix for compatibility
-		s = strings.TrimPrefix(s, "0x")
-	}
-
-	// Log the transformation
-	log.Printf("Converting address: %s -> %s", original, s)
-
-	// Validate length
-	if len(s) != 40 {
-		return common.Address{}, fmt.Errorf("invalid address length: %d (expected 40 characters)", len(s))
-	}
-
-	// Convert to lowercase to ensure consistent decoding
-	s = strings.ToLower(s)
-	bytes, err := hex.DecodeString(s)
+// Run starts the indexing process
+func (i *Indexer) Run(ctx context.Context) error {
+	// Check if the node is fully synced
+	syncing, err := i.client.SyncProgress(ctx)
 	if err != nil {
-		return common.Address{}, err
+		return fmt.Errorf("failed to check sync progress: %w", err)
+	}
+	if syncing != nil {
+		return fmt.Errorf("node is not fully synced: current block %d, highest block %d", syncing.CurrentBlock, syncing.HighestBlock)
+	}
+	log.Println("Node is fully synced")
+
+	// Start indexing historical blocks
+	log.Printf("Indexing historical blocks up to block number: %d", i.historical)
+	for blockNum := uint64(0); blockNum <= i.historical; blockNum++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			log.Printf("Processing block %d", blockNum)
+
+			// Index validators periodically
+			if err := i.indexValidatorsPeriodically(ctx, blockNum); err != nil {
+				log.Printf("Validator indexing error at block %d: %v", blockNum, err)
+				continue
+			}
+
+			// Index the block
+			if err := indexBlock(ctx, i.client, i.rpcClient, i.db, blockNum, i.chainID); err != nil {
+				log.Printf("Indexing error: insert block %d: %v", blockNum, err)
+				continue
+			}
+			time.Sleep(i.rateLimit)
+		}
 	}
 
-	var addr common.Address
-	copy(addr[:], bytes)
-	return addr, nil
+	// Start listening for new blocks
+	headers := make(chan *types.Header)
+	sub, err := i.client.SubscribeNewHead(ctx, headers)
+	if err != nil {
+		return fmt.Errorf("failed to subscribe to new headers: %w", err)
+	}
+	defer sub.Unsubscribe()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-sub.Err():
+			return fmt.Errorf("subscription error: %w", err)
+		case header := <-headers:
+			blockNum := header.Number.Uint64()
+			log.Printf("New block received: %d", blockNum)
+
+			// Index validators periodically
+			if err := i.indexValidatorsPeriodically(ctx, blockNum); err != nil {
+				log.Printf("Validator indexing error at block %d: %v", blockNum, err)
+				continue
+			}
+
+			// Index the block
+			if err := indexBlock(ctx, i.client, i.rpcClient, i.db, blockNum, i.chainID); err != nil {
+				log.Printf("Indexing error: insert block %d: %v", blockNum, err)
+				continue
+			}
+			i.latest = blockNum
+		}
+	}
 }

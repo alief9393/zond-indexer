@@ -1,4 +1,4 @@
-package main
+package db
 
 import (
 	"context"
@@ -7,7 +7,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Migrate applies the database schema migrations.
 func Migrate(db *pgxpool.Pool) error {
 	// Start a transaction for the migration
 	ctx := context.Background()
