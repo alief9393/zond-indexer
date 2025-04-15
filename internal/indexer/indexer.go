@@ -36,6 +36,10 @@ type Indexer struct {
 	historical         uint64
 	lastValidatorIndex uint64
 	epochLength        uint64
+	lastHead           struct {
+		blockNumber int64
+		blockHash   []byte
+	}
 }
 
 func NewIndexer(config config.Config) (*Indexer, error) {
@@ -219,7 +223,7 @@ func sortSlice[T any](slice []T, less func(i, j int) bool) {
 }
 
 // indexBlock processes a single block and indexes its data into the db.
-func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.Client, db *pgxpool.Pool, blockNum uint64, chainID *big.Int) error {
+func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.Client, db *pgxpool.Pool, blockNum uint64, chainID *big.Int, canonical bool) error {
 	block, err := client.BlockByNumber(ctx, big.NewInt(int64(blockNum)))
 	if err != nil {
 		return fmt.Errorf("fetch block %d: %w", blockNum, err)
@@ -227,11 +231,11 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 
 	tx, err := db.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
+		return fmt.Errorf("begin transaction: %w", blockNum, err)
 	}
 	defer tx.Rollback(ctx)
 
-	// Insert Block
+	// Insert Block with canonical status
 	var baseFeePerGas *int64
 	if baseFee := block.BaseFee(); baseFee != nil {
 		if baseFee.IsInt64() {
@@ -263,16 +267,23 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 
 	_, err = tx.Exec(ctx,
 		`INSERT INTO Blocks (
-            block_number, block_hash, timestamp, miner_address, parent_hash,
+            block_number, block_hash, timestamp, miner_address, canonical, parent_hash,
             gas_used, gas_limit, size, transaction_count, extra_data,
             base_fee_per_gas, transactions_root, state_root, receipts_root,
             logs_bloom, chain_id, retrieved_from
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-        ON CONFLICT (block_number) DO NOTHING`,
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+        ON CONFLICT (block_number) DO UPDATE
+        SET block_hash = EXCLUDED.block_hash, timestamp = EXCLUDED.timestamp, canonical = EXCLUDED.canonical,
+            parent_hash = EXCLUDED.parent_hash, gas_used = EXCLUDED.gas_used, gas_limit = EXCLUDED.gas_limit,
+            size = EXCLUDED.size, transaction_count = EXCLUDED.transaction_count, extra_data = EXCLUDED.extra_data,
+            base_fee_per_gas = EXCLUDED.base_fee_per_gas, transactions_root = EXCLUDED.transactions_root,
+            state_root = EXCLUDED.state_root, receipts_root = EXCLUDED.receipts_root, logs_bloom = EXCLUDED.logs_bloom,
+            chain_id = EXCLUDED.chain_id, retrieved_from = EXCLUDED.retrieved_from`,
 		block.Number().Int64(),
 		blockHashBytes,
 		time.Unix(int64(block.Time()), 0),
 		minerAddrBytes,
+		canonical, // Pass the canonical status
 		parentHashBytes,
 		gasUsedStr,
 		gasLimitStr,
@@ -290,6 +301,7 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 		return fmt.Errorf("insert block %d: %w", blockNum, err)
 	}
 
+	// Rest of the function remains the same until we insert related data
 	// Process Transactions and Collect Accounts
 	accounts := make(map[string]bool)
 	contracts := make(map[common.Address]bool)
@@ -312,7 +324,6 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 	// Process ZondNodes (node info)
 	if err := node.IndexZondNodes(ctx, client, tx); err != nil {
 		log.Printf("Failed to index ZondNodes for block %d: %v", blockNum, err)
-		// Not critical, so we continue
 	}
 
 	for _, transaction := range block.Transactions() {
@@ -367,9 +378,17 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
                 tx_hash, block_number, from_address, to_address, value, gas,
                 gas_price, type, chain_id, access_list, max_fee_per_gas,
                 max_priority_fee_per_gas, transaction_index, cumulative_gas_used,
-                is_successful, retrieved_from
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-            ON CONFLICT (tx_hash) DO NOTHING`,
+                is_successful, retrieved_from, is_canonical
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            ON CONFLICT (tx_hash) DO UPDATE
+            SET block_number = EXCLUDED.block_number, from_address = EXCLUDED.from_address,
+                to_address = EXCLUDED.to_address, value = EXCLUDED.value, gas = EXCLUDED.gas,
+                gas_price = EXCLUDED.gas_price, type = EXCLUDED.type, chain_id = EXCLUDED.chain_id,
+                access_list = EXCLUDED.access_list, max_fee_per_gas = EXCLUDED.max_fee_per_gas,
+                max_priority_fee_per_gas = EXCLUDED.max_priority_fee_per_gas,
+                transaction_index = EXCLUDED.transaction_index, cumulative_gas_used = EXCLUDED.cumulative_gas_used,
+                is_successful = EXCLUDED.is_successful, retrieved_from = EXCLUDED.retrieved_from,
+                is_canonical = EXCLUDED.is_canonical`,
 			transaction.Hash().Bytes(),
 			block.Number().Int64(),
 			fromAddrBytes,
@@ -385,7 +404,8 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 			int(receipt.TransactionIndex),
 			int64(receipt.CumulativeGasUsed),
 			receipt.Status == 1,
-			"zond_node")
+			"zond_node",
+			canonical) // Set is_canonical based on the block
 		if err != nil {
 			return fmt.Errorf("insert transaction %s: %w", transaction.Hash().Hex(), err)
 		}
@@ -431,7 +451,7 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 			}
 		}
 
-		if err := token.IndexTokenTransactionsAndNFTs(ctx, rpcClient, tx, transaction, receipt, blockNum); err != nil {
+		if err := token.IndexTokenTransactionsAndNFTs(ctx, rpcClient, tx, transaction, receipt, blockNum, canonical); err != nil {
 			return fmt.Errorf("index token transactions and NFTs for tx %s: %w", transaction.Hash().Hex(), err)
 		}
 	}
@@ -504,7 +524,12 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
                 optimization_enabled, runs, constructor_arguments, verified_date,
                 license, is_canonical, retrieved_at, retrieved_from
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            ON CONFLICT (address) DO NOTHING`,
+            ON CONFLICT (address) DO UPDATE
+            SET contract_name = EXCLUDED.contract_name, compiler_version = EXCLUDED.compiler_version,
+                abi = EXCLUDED.abi, source_code = EXCLUDED.source_code,
+                optimization_enabled = EXCLUDED.optimization_enabled, runs = EXCLUDED.runs,
+                constructor_arguments = EXCLUDED.constructor_arguments, verified_date = EXCLUDED.verified_date,
+                license = EXCLUDED.license, is_canonical = EXCLUDED.is_canonical`,
 			contractAddrBytes,
 			"Unknown",
 			"Unknown",
@@ -515,7 +540,7 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 			"",
 			nil,
 			"",
-			true,
+			canonical, // Set is_canonical based on the block
 			time.Now(),
 			"zond_node")
 		if err != nil {
@@ -524,13 +549,13 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 	}
 
 	for tokenAddr := range tokenContracts {
-		if err := token.IndexToken(ctx, rpcClient, tx, tokenAddr, blockNum); err != nil {
+		if err := token.IndexToken(ctx, rpcClient, tx, tokenAddr, blockNum, canonical); err != nil {
 			return fmt.Errorf("index token %s: %w", tokenAddr.Hex(), err)
 		}
 	}
 
 	for nftAddr := range nftContracts {
-		if err := token.IndexNFTs(ctx, rpcClient, tx, nftAddr, blockNum); err != nil {
+		if err := token.IndexNFTs(ctx, rpcClient, tx, nftAddr, blockNum, canonical); err != nil {
 			return fmt.Errorf("index NFTs for contract %s: %w", nftAddr.Hex(), err)
 		}
 	}
@@ -539,7 +564,7 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 		return fmt.Errorf("commit transaction: %w", err)
 	}
 
-	log.Printf("Block %d: Miner=%s, Txs=%d, Accounts=%d", blockNum, minerAddr, len(block.Transactions()), len(accounts))
+	log.Printf("Block %d: Miner=%s, Txs=%d, Accounts=%d, Canonical=%t", blockNum, minerAddr, len(block.Transactions()), len(accounts), canonical)
 	return nil
 }
 
@@ -570,11 +595,21 @@ func (i *Indexer) Run(ctx context.Context) error {
 				continue
 			}
 
-			// Index the block
-			if err := indexBlock(ctx, i.client, i.rpcClient, i.db, blockNum, i.chainID); err != nil {
+			// Index the block as canonical initially
+			if err := indexBlock(ctx, i.client, i.rpcClient, i.db, blockNum, i.chainID, true); err != nil {
 				log.Printf("Indexing error: insert block %d: %v", blockNum, err)
 				continue
 			}
+
+			// Update last head
+			block, err := i.client.BlockByNumber(ctx, big.NewInt(int64(blockNum)))
+			if err != nil {
+				log.Printf("Failed to fetch block %d for head tracking: %v", blockNum, err)
+				continue
+			}
+			i.lastHead.blockNumber = block.Number().Int64()
+			i.lastHead.blockHash = block.Hash().Bytes()
+
 			time.Sleep(i.rateLimit)
 		}
 	}
@@ -597,18 +632,163 @@ func (i *Indexer) Run(ctx context.Context) error {
 			blockNum := header.Number.Uint64()
 			log.Printf("New block received: %d", blockNum)
 
+			// Fetch the full block to check for reorgs
+			block, err := i.client.BlockByNumber(ctx, big.NewInt(int64(blockNum)))
+			if err != nil {
+				log.Printf("Failed to fetch block %d: %v", blockNum, err)
+				continue
+			}
+
+			// Check for reorg
+			parentHash := block.ParentHash().Bytes()
+			if i.lastHead.blockNumber > 0 && i.lastHead.blockNumber == int64(blockNum)-1 {
+				if !bytesEqual(parentHash, i.lastHead.blockHash) {
+					log.Printf("Reorg detected at block %d", blockNum)
+					if err := i.handleReorg(ctx, block); err != nil {
+						log.Printf("Failed to handle reorg at block %d: %v", blockNum, err)
+						continue
+					}
+				}
+			}
+
 			// Index validators periodically
 			if err := i.indexValidatorsPeriodically(ctx, blockNum); err != nil {
 				log.Printf("Validator indexing error at block %d: %v", blockNum, err)
 				continue
 			}
 
-			// Index the block
-			if err := indexBlock(ctx, i.client, i.rpcClient, i.db, blockNum, i.chainID); err != nil {
+			// Index the block as canonical
+			if err := indexBlock(ctx, i.client, i.rpcClient, i.db, blockNum, i.chainID, true); err != nil {
 				log.Printf("Indexing error: insert block %d: %v", blockNum, err)
 				continue
 			}
+
+			// Update last head
+			i.lastHead.blockNumber = block.Number().Int64()
+			i.lastHead.blockHash = block.Hash().Bytes()
 			i.latest = blockNum
 		}
 	}
+}
+
+func (i *Indexer) handleReorg(ctx context.Context, newHead *types.Block) error {
+	// Traverse backwards from the new head to find the common ancestor
+	newChain := make(map[int64][]byte)
+	currentBlock := newHead
+	for currentBlock != nil {
+		newChain[currentBlock.Number().Int64()] = currentBlock.Hash().Bytes()
+		parent, err := i.client.BlockByHash(ctx, currentBlock.ParentHash())
+		if err != nil {
+			return fmt.Errorf("fetch parent block: %w", err)
+		}
+		currentBlock = parent
+		// Stop at a reasonable depth (e.g., 10 blocks) to avoid excessive traversal
+		if len(newChain) > 10 {
+			break
+		}
+	}
+
+	// Fetch the old chain from the database
+	oldChain := make(map[int64][]byte)
+	rows, err := i.db.Query(ctx, `
+        SELECT block_number, block_hash
+        FROM Blocks
+        WHERE block_number >= $1 AND block_number <= $2 AND canonical = TRUE
+    `, newHead.Number().Int64()-int64(len(newChain)), newHead.Number().Int64())
+	if err != nil {
+		return fmt.Errorf("fetch old chain: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var blockNumber int64
+		var blockHash []byte
+		if err := rows.Scan(&blockNumber, &blockHash); err != nil {
+			return fmt.Errorf("scan old chain block: %w", err)
+		}
+		oldChain[blockNumber] = blockHash
+	}
+
+	// Find the fork point
+	forkPoint := newHead.Number().Int64()
+	for blockNumber := newHead.Number().Int64(); blockNumber >= newHead.Number().Int64()-int64(len(newChain)); blockNumber-- {
+		newHash, inNew := newChain[blockNumber]
+		oldHash, inOld := oldChain[blockNumber]
+		if inNew && inOld && bytesEqual(newHash, oldHash) {
+			forkPoint = blockNumber
+			break
+		}
+	}
+
+	// Mark blocks in the old chain as non-canonical
+	tx, err := i.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin transaction for reorg: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	_, err = tx.Exec(ctx, `
+        UPDATE Blocks
+        SET canonical = FALSE
+        WHERE block_number > $1 AND block_number <= $2 AND canonical = TRUE
+    `, forkPoint, newHead.Number().Int64())
+	if err != nil {
+		return fmt.Errorf("mark old chain as non-canonical: %w", err)
+	}
+
+	// Mark related data as non-canonical
+	_, err = tx.Exec(ctx, `
+        UPDATE Transactions
+        SET is_canonical = FALSE
+        WHERE block_number > $1 AND block_number <= $2 AND is_canonical = TRUE
+    `, forkPoint, newHead.Number().Int64())
+	if err != nil {
+		return fmt.Errorf("mark transactions as non-canonical: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `
+        UPDATE TokenTransactions
+        SET is_canonical = FALSE
+        WHERE block_number > $1 AND block_number <= $2 AND is_canonical = TRUE
+    `, forkPoint, newHead.Number().Int64())
+	if err != nil {
+		return fmt.Errorf("mark token transactions as non-canonical: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `
+        UPDATE NFTs
+        SET is_canonical = FALSE
+        WHERE block_number > $1 AND block_number <= $2 AND is_canonical = TRUE
+    `, forkPoint, newHead.Number().Int64())
+	if err != nil {
+		return fmt.Errorf("mark NFTs as non-canonical: %w", err)
+	}
+
+	// Reindex the new chain
+	for blockNumber := forkPoint + 1; blockNumber <= newHead.Number().Int64(); blockNumber++ {
+		if _, ok := newChain[blockNumber]; !ok {
+			continue // Skip if we don't have the block in the new chain
+		}
+		if err := indexBlock(ctx, i.client, i.rpcClient, i.db, uint64(blockNumber), i.chainID, true); err != nil {
+			return fmt.Errorf("reindex block %d: %w", blockNumber, err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit reorg transaction: %w", err)
+	}
+
+	return nil
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

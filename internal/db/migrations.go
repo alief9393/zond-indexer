@@ -48,6 +48,7 @@ func Migrate(db *pgxpool.Pool) error {
             block_hash BYTEA NOT NULL,
             timestamp TIMESTAMP NOT NULL,
             miner_address type_address NOT NULL,
+            canonical BOOL DEFAULT TRUE,
             parent_hash BYTEA NOT NULL,
             gas_used BIGINT NOT NULL,
             gas_limit BIGINT NOT NULL,
