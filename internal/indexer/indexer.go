@@ -10,11 +10,12 @@ import (
 	"strconv"
 	"time"
 
-	"ZOND-INDEXER/internal/config"
-	"ZOND-INDEXER/internal/models"
-	"ZOND-INDEXER/internal/node"
-	"ZOND-INDEXER/internal/token"
-	"ZOND-INDEXER/internal/utils"
+	"zond-indexer/internal/config"
+	dbpkg "zond-indexer/internal/db"
+	"zond-indexer/internal/models"
+	"zond-indexer/internal/node"
+	"zond-indexer/internal/token"
+	"zond-indexer/internal/utils"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -154,7 +155,7 @@ func (i *Indexer) indexValidatorsPeriodically(ctx context.Context, blockNum uint
 }
 
 // indexGasPrices calculates gas price for a block
-func indexGasPrices(ctx context.Context, client *zondclient.Client, tx pgx.Tx, block *types.Block, blockNum uint64) error {
+func indexGasPrices(ctx context.Context, _ *zondclient.Client, tx pgx.Tx, block *types.Block, blockNum uint64) error {
 	var gasPrices []*big.Int
 	for _, transaction := range block.Transactions() {
 		gasPrice := transaction.GasPrice()
@@ -177,17 +178,25 @@ func indexGasPrices(ctx context.Context, client *zondclient.Client, tx pgx.Tx, b
 	timestamp := time.Unix(int64(block.Time()), 0)
 	_, err := tx.Exec(ctx,
 		`INSERT INTO GasPrices (
-            timestamp, low_price, average_price, high_price, block_number,
-            retrieved_at, retrieved_from
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (timestamp, block_number) DO NOTHING`,
+			timestamp, low_price, average_price, high_price, block_number,
+			retrieved_at, retrieved_from, reverted_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (timestamp, block_number) DO UPDATE
+		SET low_price = EXCLUDED.low_price,
+			average_price = EXCLUDED.average_price,
+			high_price = EXCLUDED.high_price,
+			retrieved_at = EXCLUDED.retrieved_at,
+			retrieved_from = EXCLUDED.retrieved_from,
+			reverted_at = EXCLUDED.reverted_at`,
 		timestamp,
 		lowPrice.Int64(),
 		averagePrice.Int64(),
 		highPrice.Int64(),
 		blockNum,
 		time.Now(),
-		"zond_node")
+		"zond_node",
+		nil, // reverted_at
+	)
 	if err != nil {
 		return fmt.Errorf("insert gas prices: %w", err)
 	}
@@ -222,6 +231,34 @@ func sortSlice[T any](slice []T, less func(i, j int) bool) {
 	}
 }
 
+func flattenTraceCalls(txHash string, blockNumber uint64, calls []node.TraceCall, depth int) []models.InternalTransaction {
+	var result []models.InternalTransaction
+
+	for _, call := range calls {
+		itx := models.InternalTransaction{
+			TxHash:      txHash,
+			From:        call.From,
+			To:          call.To,
+			Value:       call.Value,
+			Input:       call.Input,
+			Output:      call.Output,
+			Type:        call.Type,
+			Gas:         call.Gas,
+			GasUsed:     call.GasUsed,
+			BlockNumber: blockNumber,
+			Depth:       depth,
+		}
+		result = append(result, itx)
+
+		if len(call.Calls) > 0 {
+			nested := flattenTraceCalls(txHash, blockNumber, call.Calls, depth+1)
+			result = append(result, nested...)
+		}
+	}
+
+	return result
+}
+
 // indexBlock processes a single block and indexes its data into the db.
 func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.Client, db *pgxpool.Pool, blockNum uint64, chainID *big.Int, canonical bool) error {
 	block, err := client.BlockByNumber(ctx, big.NewInt(int64(blockNum)))
@@ -231,7 +268,7 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 
 	tx, err := db.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("begin transaction: %w", blockNum, err)
+		return fmt.Errorf("begin transaction %d: %w", blockNum, err)
 	}
 	defer tx.Rollback(ctx)
 
@@ -454,6 +491,28 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 		if err := token.IndexTokenTransactionsAndNFTs(ctx, rpcClient, tx, transaction, receipt, blockNum, canonical); err != nil {
 			return fmt.Errorf("index token transactions and NFTs for tx %s: %w", transaction.Hash().Hex(), err)
 		}
+		trace, err := node.TraceTransaction(ctx, "http://localhost:58980", transaction.Hash().Hex())
+		if err != nil {
+			log.Printf("Block %d: Failed to trace internal txs for %s: %v", blockNum, transaction.Hash().Hex(), err)
+		} else {
+			var internalTxs []models.InternalTransaction
+
+			if len(trace.Calls) > 0 {
+				internalTxs = flattenTraceCalls(transaction.Hash().Hex(), blockNum, trace.Calls, 0)
+			} else if len(trace.StructLogs) > 0 {
+				internalTxs = node.ConvertStructLogsToInternalTxs(transaction.Hash().Hex(), blockNum, trace.StructLogs)
+			}
+
+			log.Printf("InsertInternalTransactions called with %d txs", len(internalTxs))
+			if len(internalTxs) == 0 {
+				log.Println("No internal transactions to insert")
+			} else {
+				if err := dbpkg.InsertInternalTransactions(ctx, tx, internalTxs, canonical); err != nil {
+					return fmt.Errorf("insert internal txs for %s: %w", transaction.Hash().Hex(), err)
+				}
+			}
+		}
+
 	}
 
 	timestamp := time.Unix(int64(block.Time()), 0)
@@ -520,16 +579,17 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 		}
 		_, err := tx.Exec(ctx,
 			`INSERT INTO Contracts (
-                address, contract_name, compiler_version, abi, source_code,
-                optimization_enabled, runs, constructor_arguments, verified_date,
-                license, is_canonical, retrieved_at, retrieved_from
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            ON CONFLICT (address) DO UPDATE
-            SET contract_name = EXCLUDED.contract_name, compiler_version = EXCLUDED.compiler_version,
-                abi = EXCLUDED.abi, source_code = EXCLUDED.source_code,
-                optimization_enabled = EXCLUDED.optimization_enabled, runs = EXCLUDED.runs,
-                constructor_arguments = EXCLUDED.constructor_arguments, verified_date = EXCLUDED.verified_date,
-                license = EXCLUDED.license, is_canonical = EXCLUDED.is_canonical`,
+				address, contract_name, compiler_version, abi, source_code,
+				optimization_enabled, runs, constructor_arguments, verified_date,
+				license, is_canonical, retrieved_at, retrieved_from
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			ON CONFLICT (address) DO UPDATE
+			SET contract_name = EXCLUDED.contract_name, compiler_version = EXCLUDED.compiler_version,
+				abi = EXCLUDED.abi, source_code = EXCLUDED.source_code,
+				optimization_enabled = EXCLUDED.optimization_enabled, runs = EXCLUDED.runs,
+				constructor_arguments = EXCLUDED.constructor_arguments, verified_date = EXCLUDED.verified_date,
+				license = EXCLUDED.license, is_canonical = EXCLUDED.is_canonical,
+				retrieved_at = EXCLUDED.retrieved_at, retrieved_from = EXCLUDED.retrieved_from`,
 			contractAddrBytes,
 			"Unknown",
 			"Unknown",
@@ -538,11 +598,11 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 			false,
 			0,
 			"",
-			nil,
-			"",
-			canonical, // Set is_canonical based on the block
-			time.Now(),
-			"zond_node")
+			nil,         // verified_date
+			"",          // license
+			canonical,   // is_canonical
+			time.Now(),  // retrieved_at
+			"zond_node") // retrieved_from
 		if err != nil {
 			return fmt.Errorf("insert contract %s: %w", contractAddr.Hex(), err)
 		}

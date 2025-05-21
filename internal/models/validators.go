@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"ZOND-INDEXER/internal/config"
+	"zond-indexer/internal/config"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/theQRL/go-zond/zondclient"
@@ -133,19 +133,30 @@ func IndexValidators(ctx context.Context, client *zondclient.Client, tx pgx.Tx, 
 		existingData, exists := existingValidators[validatorIndex]
 		if !exists {
 			// New validator
-			_, err = tx.Exec(ctx,
+			_, err := tx.Exec(ctx,
 				`INSERT INTO Validators (
-                    validator_index, public_key, deposit_amount, withdrawal_credentials,
-                    effective_balance, status, retrieved_at, retrieved_from
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+					validator_index, public_key, deposit_amount, withdrawal_credentials,
+					effective_balance, status, retrieved_at, retrieved_from, reverted_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				ON CONFLICT (validator_index) DO UPDATE
+				SET public_key = EXCLUDED.public_key,
+					deposit_amount = EXCLUDED.deposit_amount,
+					withdrawal_credentials = EXCLUDED.withdrawal_credentials,
+					effective_balance = EXCLUDED.effective_balance,
+					status = EXCLUDED.status,
+					retrieved_at = EXCLUDED.retrieved_at,
+					retrieved_from = EXCLUDED.retrieved_from,
+					reverted_at = EXCLUDED.reverted_at`,
 				validatorIndex,
-				newData.PublicKey,
-				newData.DepositAmount,
-				newData.WithdrawalCredentials,
-				newData.EffectiveBalance,
-				newData.Status,
+				publicKeyBytes,
+				depositAmount,
+				withdrawalCredentialsBytes,
+				effectiveBalance,
+				v.Status,
 				time.Now(),
-				"qrysm_beacon_node")
+				"zond_node",
+				nil, // reverted_at
+			)
 			if err != nil {
 				log.Printf("Failed to insert validator %s: %v", v.Index, err)
 				continue

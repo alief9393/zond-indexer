@@ -58,23 +58,29 @@ func IndexToken(ctx context.Context, client *rpc.Client, tx pgx.Tx, addr common.
 
 	_, err = tx.Exec(ctx,
 		`INSERT INTO Tokens (
-            contract_address, token_name, symbol, decimals, total_supply, block_number,
-            retrieved_at, retrieved_from, is_canonical
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        ON CONFLICT (contract_address) DO UPDATE
-        SET token_name = EXCLUDED.token_name, symbol = EXCLUDED.symbol, decimals = EXCLUDED.decimals,
-            total_supply = EXCLUDED.total_supply, block_number = EXCLUDED.block_number,
-            retrieved_at = EXCLUDED.retrieved_at, retrieved_from = EXCLUDED.retrieved_from,
-            is_canonical = EXCLUDED.is_canonical`,
+			contract_address, token_name, token_symbol, total_supply, decimals, token_type,
+			website, logo, is_canonical, retrieved_at, retrieved_from, reverted_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		ON CONFLICT (contract_address) DO UPDATE
+		SET token_name = EXCLUDED.token_name, token_symbol = EXCLUDED.token_symbol,
+			total_supply = EXCLUDED.total_supply, decimals = EXCLUDED.decimals,
+			token_type = EXCLUDED.token_type, website = EXCLUDED.website,
+			logo = EXCLUDED.logo, is_canonical = EXCLUDED.is_canonical,
+			retrieved_at = EXCLUDED.retrieved_at, retrieved_from = EXCLUDED.retrieved_from,
+			reverted_at = EXCLUDED.reverted_at`,
 		addr.Bytes(),
 		nameStr,
 		symbolStr,
-		decimalsInt,
 		totalSupplyStr,
-		blockNum,
+		decimalsInt,
+		"ERC20",
+		"",
+		"",
+		canonical,
 		time.Now(),
 		"zond_node",
-		canonical)
+		nil,
+	)
 	if err != nil {
 		return fmt.Errorf("insert token %s: %w", addr.Hex(), err)
 	}
@@ -102,23 +108,24 @@ func IndexTokenTransactionsAndNFTs(ctx context.Context, client *rpc.Client, tx p
 
 			_, err := tx.Exec(ctx,
 				`INSERT INTO TokenTransactions (
-                    tx_hash, token_address, from_address, to_address, value,
-                    block_number, retrieved_at, retrieved_from, is_canonical
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                ON CONFLICT (tx_hash) DO UPDATE
-                SET token_address = EXCLUDED.token_address, from_address = EXCLUDED.from_address,
-                    to_address = EXCLUDED.to_address, value = EXCLUDED.value,
-                    block_number = EXCLUDED.block_number, retrieved_at = EXCLUDED.retrieved_at,
-                    retrieved_from = EXCLUDED.retrieved_from, is_canonical = EXCLUDED.is_canonical`,
+					tx_hash, contract_address, from_address, to_address, token_id, value,
+					is_canonical, retrieved_at, retrieved_from, reverted_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				ON CONFLICT (tx_hash, contract_address, from_address, to_address, token_id) DO UPDATE
+				SET value = EXCLUDED.value, is_canonical = EXCLUDED.is_canonical,
+					retrieved_at = EXCLUDED.retrieved_at, retrieved_from = EXCLUDED.retrieved_from,
+					reverted_at = EXCLUDED.reverted_at`,
 				transaction.Hash().Bytes(),
 				txLog.Address.Bytes(),
 				fromAddr.Bytes(),
 				toAddr.Bytes(),
-				value.String(),
-				blockNum,
+				"", // token_id (empty for ERC20)
+				value.Int64(),
+				canonical,
 				time.Now(),
 				"zond_node",
-				canonical)
+				nil, // reverted_at
+			)
 			if err != nil {
 				return fmt.Errorf("insert token transaction: %w", err)
 			}
@@ -160,20 +167,24 @@ func IndexTokenTransactionsAndNFTs(ctx context.Context, client *rpc.Client, tx p
 
 				_, err = tx.Exec(ctx,
 					`INSERT INTO NFTs (
-                        token_address, token_id, owner_address, token_uri, metadata,
-                        block_number, retrieved_at, retrieved_from, is_canonical
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                    ON CONFLICT (token_address, token_id) DO UPDATE
-                    SET owner_address = $3, block_number = $6, is_canonical = $9`,
+						contract_address, token_id, token_uri, owner, metadata,
+						is_canonical, retrieved_at, retrieved_from, reverted_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+					ON CONFLICT (contract_address, token_id) DO UPDATE
+					SET owner = EXCLUDED.owner, token_uri = EXCLUDED.token_uri,
+						metadata = EXCLUDED.metadata, is_canonical = EXCLUDED.is_canonical,
+						retrieved_at = EXCLUDED.retrieved_at, retrieved_from = EXCLUDED.retrieved_from,
+						reverted_at = EXCLUDED.reverted_at`,
 					txLog.Address.Bytes(),
 					tokenID.String(),
-					toAddr.Bytes(),
 					metadata.TokenURI,
+					toAddr.Bytes(),
 					metadataJSON,
-					blockNum,
+					canonical,
 					time.Now(),
 					"zond_node",
-					canonical)
+					nil,
+				)
 				if err != nil {
 					return fmt.Errorf("insert NFT: %w", err)
 				}

@@ -61,3 +61,20 @@ func IsValidHexAddress(addr string) bool {
 	}
 	return true
 }
+
+func HexToAddressBytes(s string) ([]byte, error) {
+	addr, err := HexToAddress(s)
+	if err != nil {
+		return nil, err
+	}
+	return addr.Bytes(), nil
+}
+
+// MustHexToAddressBytes is a strict version that never fails (optional fallback)
+func MustHexToAddressBytes(s string) []byte {
+	bz, err := HexToAddressBytes(s)
+	if err != nil || len(bz) != 20 {
+		return make([]byte, 20) // insert placeholder to avoid panic
+	}
+	return bz
+}

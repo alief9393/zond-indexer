@@ -247,6 +247,68 @@ func Migrate(db *pgxpool.Pool) error {
 		return fmt.Errorf("create ZondNodes table: %w", err)
 	}
 
+	_, err = tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS InternalTransactions (
+        tx_hash BYTEA NOT NULL,
+        block_number BIGINT NOT NULL REFERENCES Blocks(block_number),
+        from_address type_address NOT NULL,
+        to_address type_address NOT NULL,
+        value TEXT NOT NULL,
+        input TEXT,
+        output TEXT,
+        type VARCHAR(50),
+        gas BIGINT,
+        gas_used BIGINT,
+        depth INTEGER NOT NULL,
+        retrieved_at TIMESTAMP,
+        retrieved_from TEXT,
+        is_canonical BOOLEAN,
+        reverted_at TIMESTAMP,
+        PRIMARY KEY (tx_hash, from_address, to_address, depth)
+    );`)
+
+	if err != nil {
+		return fmt.Errorf("create InternalTransactions table: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS Blobs (
+        blob_hash BYTEA PRIMARY KEY,
+        block_number BIGINT NOT NULL REFERENCES Blocks(block_number),
+        proposer_index INT NOT NULL,
+        data TEXT NOT NULL,
+        timestamp TIMESTAMP NOT NULL,
+        retrieved_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        retrieved_from VARCHAR
+    );`)
+	if err != nil {
+		return fmt.Errorf("create Blobs table: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS BundleTransactions (
+        bundle_id VARCHAR(255) NOT NULL,
+        tx_hash BYTEA NOT NULL REFERENCES Transactions(tx_hash),
+        timestamp TIMESTAMP NOT NULL,
+        block_number BIGINT NOT NULL REFERENCES Blocks(block_number),
+        PRIMARY KEY (bundle_id, tx_hash)
+    );`)
+	if err != nil {
+		return fmt.Errorf("create BundleTransactions table: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS AccountAbstraction (
+        address type_address PRIMARY KEY,
+        nonce BIGINT,
+        init_code TEXT,
+        validation_data TEXT,
+        paymaster_and_data TEXT,
+        signature TEXT,
+        block_number BIGINT REFERENCES Blocks(block_number),
+        retrieved_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        retrieved_from VARCHAR
+    );`)
+	if err != nil {
+		return fmt.Errorf("create AccountAbstraction table: %w", err)
+	}
+
 	// Commit the transaction
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit transaction: %w", err)

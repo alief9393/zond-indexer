@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"ZOND-INDEXER/internal/utils"
+	"zond-indexer/internal/utils"
 
 	"github.com/theQRL/go-zond/common"
 	"github.com/theQRL/go-zond/common/hexutil"

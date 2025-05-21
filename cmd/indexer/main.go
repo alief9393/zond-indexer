@@ -7,9 +7,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"ZOND-INDEXER/internal/config"
-	"ZOND-INDEXER/internal/db"
-	"ZOND-INDEXER/internal/indexer"
+	"zond-indexer/internal/config"
+	"zond-indexer/internal/db"
+	"zond-indexer/internal/indexer"
 
 	"github.com/joho/godotenv"
 )
