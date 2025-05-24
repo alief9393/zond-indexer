@@ -1,16 +1,13 @@
 package node
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"math/big"
-	"net/http"
 	"zond-indexer/internal/models"
 
 	"github.com/rs/zerolog/log"
+	"github.com/theQRL/go-zond/rpc"
 )
 
 // StructLog represents one EVM execution step from structLogs
@@ -105,48 +102,17 @@ func ConvertStructLogsToInternalTxs(txHash string, blockNumber uint64, logs []Tr
 }
 
 // TraceTransaction calls debug_traceTransaction on the node
-func TraceTransaction(ctx context.Context, rpcURL, txHash string) (*TraceTransactionResult, error) {
-	payload := map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "debug_traceTransaction",
-		"params":  []interface{}{txHash},
-	}
-
-	body, err := json.Marshal(payload)
+func TraceTransaction(ctx context.Context, rpcClient *rpc.Client, txHash string) (*TraceTransactionResult, error) {
+	var result TraceTransactionResult
+	err := rpcClient.CallContext(ctx, &result, "debug_traceTransaction", txHash, map[string]interface{}{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request payload: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", rpcURL, bytes.NewBuffer(body))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to call trace API: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		msg, _ := ioutil.ReadAll(resp.Body)
-		return nil, fmt.Errorf("trace API returned non-200: %s", string(msg))
-	}
-
-	var rawResp struct {
-		Result TraceTransactionResult `json:"result"`
-		Error  interface{}            `json:"error"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&rawResp); err != nil {
-		return nil, fmt.Errorf("failed to decode trace result: %w", err)
+		return nil, fmt.Errorf("trace call failed: %w", err)
 	}
 
 	log.Debug().
 		Str("tx", txHash).
-		Int("structLogSteps", len(rawResp.Result.StructLogs)).
+		Int("structLogSteps", len(result.StructLogs)).
 		Msg("Fetched internal trace")
 
-	return &rawResp.Result, nil
+	return &result, nil
 }

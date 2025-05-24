@@ -17,43 +17,38 @@ import (
 	"github.com/theQRL/go-zond/rpc"
 )
 
-// IndexToken indexes an ERC20 token contract
-func IndexToken(ctx context.Context, client *rpc.Client, tx pgx.Tx, addr common.Address, blockNum uint64, canonical bool) error {
+// IndexToken indexes a token contract based on its type
+func IndexToken(ctx context.Context, client *rpc.Client, tx pgx.Tx, addr common.Address, blockNum uint64, canonical bool, tokenType string) error {
 	name, err := callContractRaw(ctx, client, addr, "name()")
 	if err != nil {
 		return fmt.Errorf("fetch name: %w", err)
 	}
-	nameStr := string(bytesTrimNull(name))
+	nameStr := decodeStringABI(name)
 
 	symbol, err := callContractRaw(ctx, client, addr, "symbol()")
 	if err != nil {
 		return fmt.Errorf("fetch symbol: %w", err)
 	}
-	symbolStr := string(bytesTrimNull(symbol))
+	symbolStr := decodeStringABI(symbol)
 
-	decimals, err := callContractRaw(ctx, client, addr, "decimals()")
-	if err != nil {
-		return fmt.Errorf("fetch decimals: %w", err)
-	}
-	var decimalsInt int
-	if len(decimals) > 0 {
-		decimalsBig := new(big.Int).SetBytes(decimals)
-		if !decimalsBig.IsInt64() {
-			return fmt.Errorf("decimals value too large: %s", decimalsBig.String())
+	decimals := 0
+	if tokenType == "ERC20" {
+		decBytes, err := callContractRaw(ctx, client, addr, "decimals()")
+		if err == nil && len(decBytes) > 0 {
+			decBig := new(big.Int).SetBytes(decBytes)
+			if decBig.IsInt64() {
+				decimals = int(decBig.Int64())
+			}
 		}
-		decimalsInt = int(decimalsBig.Int64())
-	} else {
-		decimalsInt = 0
 	}
 
-	totalSupply, err := callContractRaw(ctx, client, addr, "totalSupply()")
-	if err != nil {
-		return fmt.Errorf("fetch totalSupply: %w", err)
-	}
 	totalSupplyStr := "0"
-	if len(totalSupply) > 0 {
-		totalSupplyBig := new(big.Int).SetBytes(totalSupply)
-		totalSupplyStr = totalSupplyBig.String()
+	if tokenType == "ERC20" {
+		supplyBytes, err := callContractRaw(ctx, client, addr, "totalSupply()")
+		if err == nil && len(supplyBytes) > 0 {
+			supplyBig := new(big.Int).SetBytes(supplyBytes)
+			totalSupplyStr = supplyBig.String()
+		}
 	}
 
 	_, err = tx.Exec(ctx,
@@ -72,8 +67,8 @@ func IndexToken(ctx context.Context, client *rpc.Client, tx pgx.Tx, addr common.
 		nameStr,
 		symbolStr,
 		totalSupplyStr,
-		decimalsInt,
-		"ERC20",
+		decimals,
+		tokenType,
 		"",
 		"",
 		canonical,
@@ -215,7 +210,7 @@ func fetchNFTMetadata(ctx context.Context, client *rpc.Client, addr common.Addre
 		}
 	}
 
-	uri := string(bytesTrimNull(tokenURI))
+	uri := string(bytesRemoveNull(tokenURI))
 	metadata.TokenURI = uri
 
 	// Fetch metadata from the token URI (simplified, assumes URI points to JSON metadata)
@@ -252,4 +247,22 @@ type NFTMetadata struct {
 // bytesTrimNull trims null bytes from the end of a byte slice
 func bytesTrimNull(b []byte) []byte {
 	return bytes.TrimRight(b, "\x00")
+}
+
+func bytesRemoveNull(b []byte) []byte {
+	return bytes.Map(func(r rune) rune {
+		if r == '\x00' {
+			return -1
+		}
+		return r
+	}, b)
+}
+
+func decodeStringABI(data []byte) string {
+	if len(data) < 96 {
+		return string(bytesTrimNull(data))
+	}
+	strLen := new(big.Int).SetBytes(data[32:64]).Int64()
+	strBytes := data[64 : 64+strLen]
+	return string(strBytes)
 }

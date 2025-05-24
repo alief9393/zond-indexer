@@ -491,7 +491,7 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 		if err := token.IndexTokenTransactionsAndNFTs(ctx, rpcClient, tx, transaction, receipt, blockNum, canonical); err != nil {
 			return fmt.Errorf("index token transactions and NFTs for tx %s: %w", transaction.Hash().Hex(), err)
 		}
-		trace, err := node.TraceTransaction(ctx, "http://localhost:58980", transaction.Hash().Hex())
+		trace, err := node.TraceTransaction(ctx, rpcClient, transaction.Hash().Hex())
 		if err != nil {
 			log.Printf("Block %d: Failed to trace internal txs for %s: %v", blockNum, transaction.Hash().Hex(), err)
 		} else {
@@ -609,7 +609,17 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 	}
 
 	for tokenAddr := range tokenContracts {
-		if err := token.IndexToken(ctx, rpcClient, tx, tokenAddr, blockNum, canonical); err != nil {
+		ok, tokenType, err := token.DetectTokenContract(ctx, client.Client(), tokenAddr)
+		if err != nil {
+			log.Printf("failed to detect token %s: %v", tokenAddr.Hex(), err)
+			continue
+		}
+		if !ok {
+			continue
+		}
+
+		err = token.IndexToken(ctx, client.Client(), tx, tokenAddr, blockNum, true, tokenType)
+		if err != nil {
 			return fmt.Errorf("index token %s: %w", tokenAddr.Hex(), err)
 		}
 	}
