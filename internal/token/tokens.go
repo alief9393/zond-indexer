@@ -23,13 +23,13 @@ func IndexToken(ctx context.Context, client *rpc.Client, tx pgx.Tx, addr common.
 	if err != nil {
 		return fmt.Errorf("fetch name: %w", err)
 	}
-	nameStr := decodeStringABI(name)
+	nameStr := name
 
 	symbol, err := callContractRaw(ctx, client, addr, "symbol()")
 	if err != nil {
 		return fmt.Errorf("fetch symbol: %w", err)
 	}
-	symbolStr := decodeStringABI(symbol)
+	symbolStr := symbol
 
 	decimals := 0
 	if tokenType == "ERC20" {
@@ -256,13 +256,4 @@ func bytesRemoveNull(b []byte) []byte {
 		}
 		return r
 	}, b)
-}
-
-func decodeStringABI(data []byte) string {
-	if len(data) < 96 {
-		return string(bytesTrimNull(data))
-	}
-	strLen := new(big.Int).SetBytes(data[32:64]).Int64()
-	strBytes := data[64 : 64+strLen]
-	return string(strBytes)
 }

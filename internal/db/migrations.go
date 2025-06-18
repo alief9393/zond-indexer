@@ -309,6 +309,19 @@ func Migrate(db *pgxpool.Pool) error {
 		return fmt.Errorf("create AccountAbstraction table: %w", err)
 	}
 
+	_, err = tx.Exec(ctx, `
+    CREATE TABLE IF NOT EXISTS TokenBalances (
+        address type_address NOT NULL REFERENCES Accounts(address),
+        token_address type_address NOT NULL REFERENCES Tokens(contract_address),
+        balance NUMERIC(38, 0) NOT NULL,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (address, token_address)
+    );
+    `)
+	if err != nil {
+		return err
+	}
+
 	// Commit the transaction
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit transaction: %w", err)
