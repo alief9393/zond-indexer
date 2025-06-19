@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -14,6 +15,8 @@ import (
 )
 
 func main() {
+	drop := flag.Bool("drop", false, "Drop all tables before migrating")
+	flag.Parse()
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found")
 	}
@@ -30,7 +33,7 @@ func main() {
 	}
 	defer pool.Close()
 
-	if err := db.Migrate(pool); err != nil {
+	if err := db.Migrate(pool, *drop); err != nil {
 		log.Fatalf("Migration failed: %v", err)
 	}
 

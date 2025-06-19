@@ -7,10 +7,29 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func Migrate(db *pgxpool.Pool) error {
-	// Start a transaction for the migration
+func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
 	ctx := context.Background()
 	tx, err := db.Begin(ctx)
+	if dropDatabase {
+		fmt.Println("Dropping all existing tables in the database...")
+		_, err := tx.Exec(ctx, `
+			DO $$
+			DECLARE
+				r RECORD;
+			BEGIN
+				FOR r IN (
+					SELECT tablename FROM pg_tables WHERE schemaname = 'public'
+				) LOOP
+					EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE';
+				END LOOP;
+			END $$;
+		`)
+		if err != nil {
+			return fmt.Errorf("failed to drop existing tables: %w", err)
+		}
+		fmt.Println("All tables dropped.")
+	}
+
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
@@ -61,7 +80,10 @@ func Migrate(db *pgxpool.Pool) error {
             receipts_root BYTEA NOT NULL,
             logs_bloom BYTEA NOT NULL,
             chain_id BIGINT NOT NULL,
-            retrieved_from VARCHAR NOT NULL
+            retrieved_from VARCHAR NOT NULL,
+            slot BIGINT,
+            reward_eth DOUBLE PRECISION,
+            burnt_fees_eth DOUBLE PRECISION
         );
     `)
 	if err != nil {
@@ -70,7 +92,7 @@ func Migrate(db *pgxpool.Pool) error {
 
 	// Create Transactions table with from_address and to_address as type_address
 	_, err = tx.Exec(ctx, `
-        CREATE TABLE IF NOT EXISTS Transactions (
+    CREATE TABLE IF NOT EXISTS Transactions (
             tx_hash BYTEA PRIMARY KEY,
             block_number BIGINT NOT NULL REFERENCES Blocks(block_number),
             from_address type_address NOT NULL,
@@ -86,7 +108,8 @@ func Migrate(db *pgxpool.Pool) error {
             transaction_index INTEGER NOT NULL,
             cumulative_gas_used BIGINT NOT NULL,
             is_successful BOOLEAN NOT NULL,
-            retrieved_from VARCHAR NOT NULL
+            retrieved_from VARCHAR NOT NULL,
+            is_canonical BOOLEAN NOT NULL DEFAULT TRUE
         );
     `)
 	if err != nil {

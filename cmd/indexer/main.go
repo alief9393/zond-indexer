@@ -8,7 +8,6 @@ import (
 	"syscall"
 
 	"zond-indexer/internal/config"
-	"zond-indexer/internal/db"
 	"zond-indexer/internal/indexer"
 
 	"github.com/joho/godotenv"
@@ -32,11 +31,6 @@ func main() {
 		log.Fatalf("Failed to create indexer: %v", err)
 	}
 	defer idx.Close()
-
-	// Apply database migrations
-	if err := db.Migrate(idx.DB()); err != nil {
-		log.Fatalf("Failed to apply migrations: %v", err)
-	}
 
 	// Set up context for shutdown
 	ctx, cancel := context.WithCancel(context.Background())

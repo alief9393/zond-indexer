@@ -260,11 +260,12 @@ func flattenTraceCalls(txHash string, blockNumber uint64, calls []node.TraceCall
 }
 
 // indexBlock processes a single block and indexes its data into the db.
-func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.Client, db *pgxpool.Pool, blockNum uint64, chainID *big.Int, canonical bool) error {
+func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Client, rpcClient *rpc.Client, db *pgxpool.Pool, blockNum uint64, chainID *big.Int, canonical bool) error {
 	block, err := client.BlockByNumber(ctx, big.NewInt(int64(blockNum)))
 	if err != nil {
 		return fmt.Errorf("fetch block %d: %w", blockNum, err)
 	}
+	slot := block.Number().Uint64()
 
 	tx, err := db.Begin(ctx)
 	if err != nil {
@@ -272,8 +273,8 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 	}
 	defer tx.Rollback(ctx)
 
-	// Insert Block with canonical status
 	var baseFeePerGas *int64
+	var rewardEth, burntFeesEth float64
 	if baseFee := block.BaseFee(); baseFee != nil {
 		if baseFee.IsInt64() {
 			bf := baseFee.Int64()
@@ -281,7 +282,31 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 		} else {
 			return fmt.Errorf("base_fee_per_gas for block %d is too large for int64: %s", blockNum, baseFee.String())
 		}
+
+		totalTip := big.NewInt(0)
+		totalGasUsed := uint64(0)
+
+		for _, tx := range block.Transactions() {
+			gasUsed := tx.Gas()
+			tip := new(big.Int).Sub(tx.GasPrice(), baseFee)
+			if tip.Sign() < 0 {
+				tip = big.NewInt(0)
+			}
+			totalTip.Add(totalTip, new(big.Int).Mul(tip, new(big.Int).SetUint64(gasUsed)))
+			totalGasUsed += gasUsed
+		}
+
+		burnt := new(big.Int).Mul(baseFee, new(big.Int).SetUint64(totalGasUsed))
+
+		burntFloat, _ := new(big.Float).Quo(new(big.Float).SetInt(burnt), big.NewFloat(1e18)).Float64()
+		rewardFloat, _ := new(big.Float).Quo(new(big.Float).SetInt(totalTip), big.NewFloat(1e18)).Float64()
+		rewardEth = rewardFloat
+		burntFeesEth = burntFloat
+
+	} else {
+		return fmt.Errorf("base_fee_per_gas is nil for block %d", blockNum)
 	}
+
 	gasUsedStr := strconv.FormatUint(block.GasUsed(), 10)
 	gasLimitStr := strconv.FormatUint(block.GasLimit(), 10)
 
@@ -304,11 +329,12 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 
 	_, err = tx.Exec(ctx,
 		`INSERT INTO Blocks (
-            block_number, block_hash, timestamp, miner_address, canonical, parent_hash,
-            gas_used, gas_limit, size, transaction_count, extra_data,
-            base_fee_per_gas, transactions_root, state_root, receipts_root,
-            logs_bloom, chain_id, retrieved_from
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+			block_number, block_hash, timestamp, miner_address, canonical, parent_hash,
+			gas_used, gas_limit, size, transaction_count, extra_data,
+			base_fee_per_gas, transactions_root, state_root, receipts_root,
+			logs_bloom, chain_id, retrieved_from,
+			slot, reward_eth, burnt_fees_eth
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
         ON CONFLICT (block_number) DO UPDATE
         SET block_hash = EXCLUDED.block_hash, timestamp = EXCLUDED.timestamp, canonical = EXCLUDED.canonical,
             parent_hash = EXCLUDED.parent_hash, gas_used = EXCLUDED.gas_used, gas_limit = EXCLUDED.gas_limit,
@@ -320,7 +346,7 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 		blockHashBytes,
 		time.Unix(int64(block.Time()), 0),
 		minerAddrBytes,
-		canonical, // Pass the canonical status
+		canonical,
 		parentHashBytes,
 		gasUsedStr,
 		gasLimitStr,
@@ -333,7 +359,10 @@ func indexBlock(ctx context.Context, client *zondclient.Client, rpcClient *rpc.C
 		receiptsRootBytes,
 		logsBloomBytes,
 		chainID.Int64(),
-		"zond_node")
+		"zond_node",
+		slot,
+		rewardEth,
+		burntFeesEth)
 	if err != nil {
 		return fmt.Errorf("insert block %d: %w", blockNum, err)
 	}
@@ -665,8 +694,10 @@ func (i *Indexer) Run(ctx context.Context) error {
 				continue
 			}
 
+			cfg, err := config.LoadConfig()
+
 			// Index the block as canonical initially
-			if err := indexBlock(ctx, i.client, i.rpcClient, i.db, blockNum, i.chainID, true); err != nil {
+			if err := indexBlock(ctx, cfg, i.client, i.rpcClient, i.db, blockNum, i.chainID, true); err != nil {
 				log.Printf("Indexing error: insert block %d: %v", blockNum, err)
 				continue
 			}
@@ -726,9 +757,9 @@ func (i *Indexer) Run(ctx context.Context) error {
 				log.Printf("Validator indexing error at block %d: %v", blockNum, err)
 				continue
 			}
-
+			cfg, err := config.LoadConfig()
 			// Index the block as canonical
-			if err := indexBlock(ctx, i.client, i.rpcClient, i.db, blockNum, i.chainID, true); err != nil {
+			if err := indexBlock(ctx, cfg, i.client, i.rpcClient, i.db, blockNum, i.chainID, true); err != nil {
 				log.Printf("Indexing error: insert block %d: %v", blockNum, err)
 				continue
 			}
@@ -839,7 +870,8 @@ func (i *Indexer) handleReorg(ctx context.Context, newHead *types.Block) error {
 		if _, ok := newChain[blockNumber]; !ok {
 			continue // Skip if we don't have the block in the new chain
 		}
-		if err := indexBlock(ctx, i.client, i.rpcClient, i.db, uint64(blockNumber), i.chainID, true); err != nil {
+		cfg, _ := config.LoadConfig()
+		if err := indexBlock(ctx, cfg, i.client, i.rpcClient, i.db, uint64(blockNumber), i.chainID, true); err != nil {
 			return fmt.Errorf("reindex block %d: %w", blockNumber, err)
 		}
 	}
