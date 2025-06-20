@@ -444,8 +444,8 @@ func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Clien
                 tx_hash, block_number, from_address, to_address, value, gas,
                 gas_price, type, chain_id, access_list, max_fee_per_gas,
                 max_priority_fee_per_gas, transaction_index, cumulative_gas_used,
-                is_successful, retrieved_from, is_canonical
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                is_successful, retrieved_from, is_canonical, timestamp
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             ON CONFLICT (tx_hash) DO UPDATE
             SET block_number = EXCLUDED.block_number, from_address = EXCLUDED.from_address,
                 to_address = EXCLUDED.to_address, value = EXCLUDED.value, gas = EXCLUDED.gas,
@@ -454,7 +454,7 @@ func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Clien
                 max_priority_fee_per_gas = EXCLUDED.max_priority_fee_per_gas,
                 transaction_index = EXCLUDED.transaction_index, cumulative_gas_used = EXCLUDED.cumulative_gas_used,
                 is_successful = EXCLUDED.is_successful, retrieved_from = EXCLUDED.retrieved_from,
-                is_canonical = EXCLUDED.is_canonical`,
+                is_canonical = EXCLUDED.is_canonical, timestamp = EXCLUDED.timestamp`,
 			transaction.Hash().Bytes(),
 			block.Number().Int64(),
 			fromAddrBytes,
@@ -471,7 +471,8 @@ func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Clien
 			int64(receipt.CumulativeGasUsed),
 			receipt.Status == 1,
 			"zond_node",
-			canonical) // Set is_canonical based on the block
+			canonical,
+			block.Time())
 		if err != nil {
 			return fmt.Errorf("insert transaction %s: %w", transaction.Hash().Hex(), err)
 		}

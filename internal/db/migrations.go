@@ -109,7 +109,8 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
             cumulative_gas_used BIGINT NOT NULL,
             is_successful BOOLEAN NOT NULL,
             retrieved_from VARCHAR NOT NULL,
-            is_canonical BOOLEAN NOT NULL DEFAULT TRUE
+            is_canonical BOOLEAN NOT NULL DEFAULT TRUE,
+            timestamp TIMESTAMPTZ
         );
     `)
 	if err != nil {
