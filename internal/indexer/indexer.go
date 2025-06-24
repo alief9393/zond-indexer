@@ -1017,6 +1017,8 @@ func fetchBeaconBlockBySlot(cfg config.Config, slot uint64) (*BeaconBlockRespons
 		return nil, fmt.Errorf("failed to read beacon block response: %w", err)
 	}
 
+	log.Println("BEACON RAW RESPONSE", string(body))
+
 	var beaconResp BeaconBlockResponse
 	if err := json.Unmarshal(body, &beaconResp); err != nil {
 		return nil, fmt.Errorf("failed to decode beacon response: %w", err)
