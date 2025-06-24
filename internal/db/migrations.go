@@ -63,28 +63,39 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
 	// Create Blocks table with address fields as type_address
 	_, err = tx.Exec(ctx, `
         CREATE TABLE IF NOT EXISTS Blocks (
-            block_number BIGINT PRIMARY KEY,
-            block_hash BYTEA NOT NULL,
-            timestamp TIMESTAMP NOT NULL,
-            miner_address type_address NOT NULL,
-            canonical BOOL DEFAULT TRUE,
-            parent_hash BYTEA NOT NULL,
-            gas_used BIGINT NOT NULL,
-            gas_limit BIGINT NOT NULL,
-            size INTEGER NOT NULL,
-            transaction_count INTEGER NOT NULL,
-            extra_data BYTEA NOT NULL,
-            base_fee_per_gas BIGINT,
-            transactions_root BYTEA NOT NULL,
-            state_root BYTEA NOT NULL,
-            receipts_root BYTEA NOT NULL,
-            logs_bloom BYTEA NOT NULL,
-            chain_id BIGINT NOT NULL,
-            retrieved_from VARCHAR NOT NULL,
-            slot BIGINT,
-            reward_eth DOUBLE PRECISION,
-            burnt_fees_eth DOUBLE PRECISION
-        );
+        block_number BIGINT PRIMARY KEY,
+        block_hash BYTEA NOT NULL,
+        timestamp TIMESTAMP NOT NULL,
+        miner_address type_address NOT NULL,
+        canonical BOOL DEFAULT TRUE,
+        parent_hash BYTEA NOT NULL,
+        gas_used BIGINT NOT NULL,
+        gas_limit BIGINT NOT NULL,
+        size INTEGER NOT NULL,
+        transaction_count INTEGER NOT NULL,
+        extra_data BYTEA NOT NULL,
+        base_fee_per_gas BIGINT,
+        transactions_root BYTEA NOT NULL,
+        state_root BYTEA NOT NULL,
+        receipts_root BYTEA NOT NULL,
+        logs_bloom BYTEA NOT NULL,
+        chain_id BIGINT NOT NULL,
+        retrieved_from VARCHAR NOT NULL,
+        slot BIGINT,
+        reward_eth DOUBLE PRECISION,
+        burnt_fees_eth DOUBLE PRECISION,
+        reorg_depth INTEGER,
+        epoch BIGINT,
+        proposer_index INTEGER,
+        graffiti TEXT,
+        randao_reveal TEXT,
+        beacon_deposit_count BIGINT,
+        slot_root BYTEA,
+        parent_root BYTEA,
+        mev_fee_recipient BYTEA,
+        mev_reward_eth DOUBLE PRECISION,
+        mev_tx_hash BYTEA
+    );
     `)
 	if err != nil {
 		return fmt.Errorf("create Blocks table: %w", err)
@@ -111,6 +122,7 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
             retrieved_from VARCHAR NOT NULL,
             is_canonical BOOLEAN NOT NULL DEFAULT TRUE,
             timestamp TIMESTAMPTZ
+            is_pending BOOLEAN DEFAULT FALSE
         );
     `)
 	if err != nil {

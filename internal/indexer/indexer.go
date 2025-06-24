@@ -5,9 +5,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
+	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"zond-indexer/internal/config"
@@ -41,6 +44,42 @@ type Indexer struct {
 		blockNumber int64
 		blockHash   []byte
 	}
+}
+
+type BeaconBlockResponse struct {
+	Data struct {
+		Message struct {
+			Slot          string `json:"slot"`
+			ProposerIndex string `json:"proposer_index"`
+			Body          struct {
+				Graffiti     string `json:"graffiti"`
+				RandaoReveal string `json:"randao_reveal"`
+				Eth1Data     struct {
+					DepositCount string `json:"deposit_count"`
+				} `json:"eth1_data"`
+
+				ExecutionPayload struct {
+					ParentHash       string `json:"parent_hash"`
+					FeeRecipient     string `json:"fee_recipient"`
+					StateRoot        string `json:"state_root"`
+					ReceiptsRoot     string `json:"receipts_root"`
+					LogsBloom        string `json:"logs_bloom"`
+					PrevRandao       string `json:"prev_randao"`
+					BlockNumber      string `json:"block_number"`
+					GasLimit         string `json:"gas_limit"`
+					GasUsed          string `json:"gas_used"`
+					Timestamp        string `json:"timestamp"`
+					ExtraData        string `json:"extra_data"`
+					BaseFeePerGas    string `json:"base_fee_per_gas"`
+					BlockHash        string `json:"block_hash"`
+					TransactionsRoot string `json:"transactions_root"`
+					PayloadHash      string `json:"payload_hash"`
+					SlotRoot         string `json:"slot_root"`
+					ParentRoot       string `json:"parent_root"`
+				} `json:"execution_payload"`
+			} `json:"body"`
+		} `json:"message"`
+	} `json:"data"`
 }
 
 func NewIndexer(config config.Config) (*Indexer, error) {
@@ -275,6 +314,8 @@ func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Clien
 
 	var baseFeePerGas *int64
 	var rewardEth, burntFeesEth float64
+	var baseFee *big.Int
+	baseFee = block.BaseFee()
 	if baseFee := block.BaseFee(); baseFee != nil {
 		if baseFee.IsInt64() {
 			bf := baseFee.Int64()
@@ -326,22 +367,79 @@ func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Clien
 	stateRootBytes := block.Root().Bytes()
 	receiptsRootBytes := block.ReceiptHash().Bytes()
 	logsBloomBytes := block.Bloom().Bytes()
+	beaconResp, err := fetchBeaconBlockBySlot(cfg, slot)
+	if err != nil {
+		return fmt.Errorf("failed to fetch beacon block: %w", err)
+	}
+
+	proposerIndex, _ := strconv.Atoi(beaconResp.Data.Message.ProposerIndex)
+	graffitiBytes, err := hexStringToBytes(beaconResp.Data.Message.Body.Graffiti)
+	if err != nil {
+		return fmt.Errorf("graffiti decode error: %w", err)
+	}
+	randaoReveal := beaconResp.Data.Message.Body.RandaoReveal
+	mevFeeRecipient := beaconResp.Data.Message.Body.ExecutionPayload.FeeRecipient
+	mevFeeRecipientBytes, err := addressToBytes(mevFeeRecipient)
+	if err != nil {
+		return fmt.Errorf("invalid mev_fee_recipient address: %w", err)
+	}
+	mevRewardEth := rewardEth
+	mevTxHash := findMEVTxHashFromTransactions(baseFee, block.Transactions())
+	mevTxHashBytes := mevTxHash
+	slotRoot := hexToBytes(beaconResp.Data.Message.Body.ExecutionPayload.SlotRoot)
+	parentRoot := hexToBytes(beaconResp.Data.Message.Body.ExecutionPayload.ParentRoot)
+	beaconDepositCount := beaconResp.Data.Message.Body.Eth1Data.DepositCount
+	epoch := int64(slot / 32)
 
 	_, err = tx.Exec(ctx,
 		`INSERT INTO Blocks (
-			block_number, block_hash, timestamp, miner_address, canonical, parent_hash,
-			gas_used, gas_limit, size, transaction_count, extra_data,
-			base_fee_per_gas, transactions_root, state_root, receipts_root,
-			logs_bloom, chain_id, retrieved_from,
-			slot, reward_eth, burnt_fees_eth
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
-        ON CONFLICT (block_number) DO UPDATE
-        SET block_hash = EXCLUDED.block_hash, timestamp = EXCLUDED.timestamp, canonical = EXCLUDED.canonical,
-            parent_hash = EXCLUDED.parent_hash, gas_used = EXCLUDED.gas_used, gas_limit = EXCLUDED.gas_limit,
-            size = EXCLUDED.size, transaction_count = EXCLUDED.transaction_count, extra_data = EXCLUDED.extra_data,
-            base_fee_per_gas = EXCLUDED.base_fee_per_gas, transactions_root = EXCLUDED.transactions_root,
-            state_root = EXCLUDED.state_root, receipts_root = EXCLUDED.receipts_root, logs_bloom = EXCLUDED.logs_bloom,
-            chain_id = EXCLUDED.chain_id, retrieved_from = EXCLUDED.retrieved_from`,
+		block_number, block_hash, timestamp, miner_address, canonical, parent_hash,
+		gas_used, gas_limit, size, transaction_count, extra_data,
+		base_fee_per_gas, transactions_root, state_root, receipts_root,
+		logs_bloom, chain_id, retrieved_from,
+		slot, epoch, proposer_index, graffiti, randao_reveal,
+		beacon_deposit_count, slot_root, parent_root,
+		mev_fee_recipient, mev_reward_eth, mev_tx_hash,
+		reward_eth, burnt_fees_eth
+	) VALUES (
+		$1, $2, $3, $4, $5, $6,
+		$7, $8, $9, $10, $11, $12,
+		$13, $14, $15, $16, $17, $18,
+		$19, $20, $21, $22, $23,
+		$24, $25, $26,
+		$27, $28, $29,
+		$30, $31
+	)
+	ON CONFLICT (block_number) DO UPDATE SET
+		block_hash = EXCLUDED.block_hash,
+		timestamp = EXCLUDED.timestamp,
+		canonical = EXCLUDED.canonical,
+		parent_hash = EXCLUDED.parent_hash,
+		gas_used = EXCLUDED.gas_used,
+		gas_limit = EXCLUDED.gas_limit,
+		size = EXCLUDED.size,
+		transaction_count = EXCLUDED.transaction_count,
+		extra_data = EXCLUDED.extra_data,
+		base_fee_per_gas = EXCLUDED.base_fee_per_gas,
+		transactions_root = EXCLUDED.transactions_root,
+		state_root = EXCLUDED.state_root,
+		receipts_root = EXCLUDED.receipts_root,
+		logs_bloom = EXCLUDED.logs_bloom,
+		chain_id = EXCLUDED.chain_id,
+		retrieved_from = EXCLUDED.retrieved_from,
+		slot = EXCLUDED.slot,
+		epoch = EXCLUDED.epoch,
+		proposer_index = EXCLUDED.proposer_index,
+		graffiti = EXCLUDED.graffiti,
+		randao_reveal = EXCLUDED.randao_reveal,
+		beacon_deposit_count = EXCLUDED.beacon_deposit_count,
+		slot_root = EXCLUDED.slot_root,
+		parent_root = EXCLUDED.parent_root,
+		mev_fee_recipient = EXCLUDED.mev_fee_recipient,
+		mev_reward_eth = EXCLUDED.mev_reward_eth,
+		mev_tx_hash = EXCLUDED.mev_tx_hash,
+		reward_eth = EXCLUDED.reward_eth,
+		burnt_fees_eth = EXCLUDED.burnt_fees_eth`,
 		block.Number().Int64(),
 		blockHashBytes,
 		time.Unix(int64(block.Time()), 0),
@@ -361,20 +459,28 @@ func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Clien
 		chainID.Int64(),
 		"zond_node",
 		slot,
+		epoch,
+		proposerIndex,
+		graffitiBytes,
+		randaoReveal,
+		beaconDepositCount,
+		slotRoot,
+		parentRoot,
+		mevFeeRecipientBytes,
+		mevRewardEth,
+		mevTxHashBytes,
 		rewardEth,
-		burntFeesEth)
+		burntFeesEth,
+	)
 	if err != nil {
 		return fmt.Errorf("insert block %d: %w", blockNum, err)
 	}
 
-	// Rest of the function remains the same until we insert related data
-	// Process Transactions and Collect Accounts
 	accounts := make(map[string]bool)
 	contracts := make(map[common.Address]bool)
 	tokenContracts := make(map[common.Address]bool)
 	nftContracts := make(map[common.Address]bool)
 
-	// Add the miner address
 	minerAddr := block.Coinbase().Hex()
 	if utils.IsValidHexAddress(minerAddr) {
 		accounts[minerAddr] = true
@@ -382,12 +488,10 @@ func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Clien
 		return fmt.Errorf("block %d: invalid miner address format: %s", blockNum, minerAddr)
 	}
 
-	// Calculate Gas Prices for the block
 	if err := indexGasPrices(ctx, client, tx, block, blockNum); err != nil {
 		return fmt.Errorf("index gas prices for block %d: %w", blockNum, err)
 	}
 
-	// Process ZondNodes (node info)
 	if err := node.IndexZondNodes(ctx, client, tx); err != nil {
 		log.Printf("Failed to index ZondNodes for block %d: %v", blockNum, err)
 	}
@@ -894,4 +998,60 @@ func bytesEqual(a, b []byte) bool {
 		}
 	}
 	return true
+}
+
+func fetchBeaconBlockBySlot(cfg config.Config, slot uint64) (*BeaconBlockResponse, error) {
+	url := fmt.Sprintf("%s/zond/v1/beacon/blocks/%d", cfg.BeaconURL(), slot)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to GET beacon block: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read beacon block response: %w", err)
+	}
+
+	var beaconResp BeaconBlockResponse
+	if err := json.Unmarshal(body, &beaconResp); err != nil {
+		return nil, fmt.Errorf("failed to decode beacon response: %w", err)
+	}
+
+	return &beaconResp, nil
+}
+
+func findMEVTxHashFromTransactions(baseFee *big.Int, txs types.Transactions) []byte {
+	var maxTip = big.NewInt(0)
+	var mevTxHash []byte
+
+	for _, tx := range txs {
+		tip := new(big.Int).Sub(tx.GasPrice(), baseFee)
+		if tip.Sign() < 0 {
+			tip = big.NewInt(0)
+		}
+		tipAmount := new(big.Int).Mul(tip, new(big.Int).SetUint64(tx.Gas()))
+		if tipAmount.Cmp(maxTip) > 0 {
+			maxTip = tipAmount
+			mevTxHash = tx.Hash().Bytes()
+		}
+	}
+	return mevTxHash
+}
+
+func hexToBytes(str string) []byte {
+	str = strings.TrimPrefix(str, "0x")
+	bytes, _ := hex.DecodeString(str)
+	return bytes
+}
+
+func addressToBytes(address string) ([]byte, error) {
+	clean := strings.TrimPrefix(address, "0x")
+	return hex.DecodeString(clean)
+}
+
+func hexStringToBytes(hexStr string) ([]byte, error) {
+	cleaned := strings.TrimPrefix(hexStr, "0x")
+	return hex.DecodeString(cleaned)
 }
