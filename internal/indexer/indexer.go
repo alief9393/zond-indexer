@@ -113,12 +113,15 @@ func NewIndexer(config config.Config) (*Indexer, error) {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	// Fetch the latest block number
-	latest, err := client.BlockNumber(context.Background())
+	// Fetch last indexed block from DB
+	var lastIndexedBlock int64
+	err = db.QueryRow(context.Background(), "SELECT COALESCE(MAX(block_number), -1) FROM blocks").Scan(&lastIndexedBlock)
 	if err != nil {
 		db.Close()
-		return nil, fmt.Errorf("failed to fetch latest block number: %w", err)
+		return nil, fmt.Errorf("failed to fetch last indexed block: %w", err)
 	}
+
+	start := uint64(lastIndexedBlock + 1)
 
 	return &Indexer{
 		config:             config,
@@ -127,8 +130,8 @@ func NewIndexer(config config.Config) (*Indexer, error) {
 		db:                 db,
 		chainID:            chainID,
 		rateLimit:          config.RateLimit,
-		latest:             latest,
-		historical:         latest,
+		latest:             start,
+		historical:         start,
 		lastValidatorIndex: 0,
 		epochLength:        32,
 	}, nil
