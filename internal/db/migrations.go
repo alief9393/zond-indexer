@@ -357,6 +357,22 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
 		return fmt.Errorf("create BundleTransactions table: %w", err)
 	}
 
+	_, err = tx.Exec(ctx, `
+        CREATE TABLE IF NOT EXISTS cmc_data (
+            id SERIAL PRIMARY KEY,
+            symbol VARCHAR(10) UNIQUE NOT NULL,
+            price_usd NUMERIC(20,10) NOT NULL,
+            price_btc NUMERIC(20,10),
+            percent_change_24h NUMERIC(10,5),
+            market_cap_usd NUMERIC(30,10),
+            source VARCHAR(50) NOT NULL DEFAULT 'CoinMarketCap',
+            retrieved_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+    `)
+	if err != nil {
+		return fmt.Errorf("create cmc_data table: %w", err)
+	}
+
 	_, err = tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS AccountAbstraction (
         address type_address PRIMARY KEY,
         nonce BIGINT,
