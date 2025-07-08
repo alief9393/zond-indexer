@@ -190,20 +190,16 @@ func IndexTokenTransactionsAndNFTs(ctx context.Context, client *rpc.Client, tx p
 	return nil
 }
 
-// IndexNFTs indexes NFTs for an ERC721 or ERC1155 contract
 func IndexNFTs(ctx context.Context, client *rpc.Client, tx pgx.Tx, addr common.Address, blockNum uint64, canonical bool) error {
 	// For simplicity, NFTs are indexed via Transfer events in IndexTokenTransactionsAndNFTs
 	return nil
 }
 
-// fetchNFTMetadata fetches the token URI and metadata for an NFT
 func fetchNFTMetadata(ctx context.Context, client *rpc.Client, addr common.Address, tokenID *big.Int) (NFTMetadata, error) {
 	var metadata NFTMetadata
 
-	// Try to fetch tokenURI (ERC721) or uri (ERC1155)
 	tokenURI, err := callContractRaw(ctx, client, addr, "tokenURI(uint256)", tokenID)
 	if err != nil || len(tokenURI) == 0 {
-		// Try ERC1155 uri
 		tokenURI, err = callContractRaw(ctx, client, addr, "uri(uint256)", tokenID)
 		if err != nil || len(tokenURI) == 0 {
 			return metadata, fmt.Errorf("fetch token URI: %w", err)
@@ -213,7 +209,6 @@ func fetchNFTMetadata(ctx context.Context, client *rpc.Client, addr common.Addre
 	uri := string(bytesRemoveNull(tokenURI))
 	metadata.TokenURI = uri
 
-	// Fetch metadata from the token URI (simplified, assumes URI points to JSON metadata)
 	if strings.HasPrefix(uri, "http://") || strings.HasPrefix(uri, "https://") {
 		httpClient := &http.Client{
 			Timeout: 5 * time.Second,
@@ -238,15 +233,9 @@ func fetchNFTMetadata(ctx context.Context, client *rpc.Client, addr common.Addre
 	return metadata, nil
 }
 
-// NFTMetadata holds metadata for an NFT
 type NFTMetadata struct {
 	TokenURI string                 `json:"token_uri"`
 	Metadata map[string]interface{} `json:"metadata"`
-}
-
-// bytesTrimNull trims null bytes from the end of a byte slice
-func bytesTrimNull(b []byte) []byte {
-	return bytes.TrimRight(b, "\x00")
 }
 
 func bytesRemoveNull(b []byte) []byte {

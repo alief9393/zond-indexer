@@ -8,7 +8,6 @@ import (
 	"github.com/theQRL/go-zond/common"
 )
 
-// HexToAddress converts a hex string to a common.Address
 func HexToAddress(s string) (common.Address, error) {
 	// Handle Z prefix for Zond addresses
 	if strings.HasPrefix(s, "Z") {
@@ -35,7 +34,6 @@ func HexToAddress(s string) (common.Address, error) {
 	return addr, nil
 }
 
-// IsValidHexAddress checks if an address is a valid 40-character hex string (with Z or 0x prefix)
 func IsValidHexAddress(addr string) bool {
 	// Check for Z prefix
 	if !strings.HasPrefix(addr, "Z") {
@@ -70,7 +68,6 @@ func HexToAddressBytes(s string) ([]byte, error) {
 	return addr.Bytes(), nil
 }
 
-// MustHexToAddressBytes is a strict version that never fails (optional fallback)
 func MustHexToAddressBytes(s string) []byte {
 	bz, err := HexToAddressBytes(s)
 	if err != nil || len(bz) != 20 {

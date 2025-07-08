@@ -32,14 +32,14 @@ func LoadConfig() (Config, error) {
 	cfg.BeaconPort = beaconPort
 
 	// Parse the rate limit (in ms)
-	rateLimitStr := getEnv("RATE_LIMIT_MS", "100")
+	rateLimitStr := getEnv("RATE_LIMIT_MS", "0")
 	rateLimitMs, err := strconv.Atoi(rateLimitStr)
 	if err != nil {
 		return Config{}, fmt.Errorf("invalid RATE_LIMIT_MS: %w", err)
 	}
 	cfg.RateLimit = time.Duration(rateLimitMs) * time.Millisecond
 
-	// Validate the configuration
+	// Valida6te the configuration
 	if cfg.RPCEndpoint == "" {
 		return Config{}, fmt.Errorf("RPC_ENDPOINT is required")
 	}

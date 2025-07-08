@@ -4,38 +4,41 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
-	"log"
 	"os"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 
 	"zond-indexer/internal/db"
+	logger "zond-indexer/internal/log"
 )
 
 func main() {
+	logger.Init()
+	logger.Logger.Info("🚀 Starting migration...")
+
 	drop := flag.Bool("drop", false, "Drop all tables before migrating")
 	flag.Parse()
+
 	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found")
+		logger.Logger.Warn("⚠️ No .env file found, proceeding without it")
 	}
 
 	connStr := os.Getenv("POSTGRES_CONN")
 	if connStr == "" {
-		log.Fatal("POSTGRES_CONN is not set")
+		logger.Logger.Fatal("❌ Environment variable POSTGRES_CONN is not set")
 	}
 
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, connStr)
 	if err != nil {
-		log.Fatalf("Unable to create connection pool: %v", err)
+		logger.Logger.WithError(err).Fatal("❌ Unable to create connection pool")
 	}
 	defer pool.Close()
 
 	if err := db.Migrate(pool, *drop); err != nil {
-		log.Fatalf("Migration failed: %v", err)
+		logger.Logger.WithError(err).Fatal("❌ Migration failed")
 	}
 
-	fmt.Println("Migration completed successfully")
+	logger.Logger.Info("✅ Migration completed successfully")
 }
