@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"zond-indexer/internal/config"
-	"zond-indexer/internal/db"
+	dbpkg "zond-indexer/internal/db"
 	"zond-indexer/internal/models"
 	"zond-indexer/internal/node"
 	"zond-indexer/internal/token"
@@ -111,8 +111,8 @@ func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Clien
 	mevRewardEth := rewardEth
 	mevTxHash := utils.FindMEVTxHashFromTransactions(baseFee, block.Transactions())
 	mevTxHashBytes := mevTxHash
-	slotRoot := utils.HexToBytes(beaconResp.Data.Message.Body.ExecutionPayload.SlotRoot)
-	parentRoot := utils.HexToBytes(beaconResp.Data.Message.Body.ExecutionPayload.ParentRoot)
+	slotRoot := utils.HexToBytes(beaconResp.Data.Message.StateRoot)
+	parentRoot := utils.HexToBytes(beaconResp.Data.Message.ParentRoot)
 	beaconDepositCount := beaconResp.Data.Message.Body.Eth1Data.DepositCount
 	epoch := int64(slot / 32)
 
@@ -181,6 +181,43 @@ func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Clien
 	_, err = tx.Exec(ctx, insertBlockSQL, args...)
 	if err != nil {
 		return fmt.Errorf("insert block %d: %w", block.Number().Int64(), err)
+	}
+
+	if beaconResp != nil {
+		withdrawals := beaconResp.Data.Message.Body.ExecutionPayload.Withdrawals
+		if len(withdrawals) > 0 {
+			dbWithdrawals := make([]dbpkg.Withdrawal, len(withdrawals))
+			for i, w := range withdrawals {
+				dbWithdrawals[i] = dbpkg.Withdrawal{
+					Index:          w.Index,
+					ValidatorIndex: w.ValidatorIndex,
+					Address:        w.Address,
+					Amount:         w.Amount,
+				}
+			}
+			if err := dbpkg.InsertWithdrawals(ctx, tx, blockNum, dbWithdrawals); err != nil {
+				return fmt.Errorf("insert withdrawals for block %d: %w", blockNum, err)
+			}
+		}
+
+		// --- Process Beacon Deposits ---
+		// Use the correct path to the deposits array
+		deposits := beaconResp.Data.Message.Body.Deposits
+		if len(deposits) > 0 {
+			dbDeposits := make([]dbpkg.BeaconDeposit, len(deposits))
+			for i, d := range deposits {
+				dbDeposits[i] = dbpkg.BeaconDeposit{
+					Index:          d.Index,
+					ValidatorIndex: d.ValidatorIndex,
+					FromAddress:    d.FromAddress,
+					Amount:         d.Amount,
+					Timestamp:      d.Timestamp,
+				}
+			}
+			if err := dbpkg.InsertBeaconDeposits(ctx, tx, blockNum, dbDeposits); err != nil {
+				return fmt.Errorf("insert beacon deposits for block %d: %w", blockNum, err)
+			}
+		}
 	}
 
 	accounts := make(map[string]bool)
@@ -405,7 +442,7 @@ func insertTransactions(
 		}
 
 		if len(internalTxs) > 0 {
-			if err := db.InsertInternalTransactions(ctx, tx, internalTxs, canonical); err != nil {
+			if err := dbpkg.InsertInternalTransactions(ctx, tx, internalTxs, canonical); err != nil {
 				return fmt.Errorf("insert internal txs for %s: %w", transaction.Hash().Hex(), err)
 			}
 		}

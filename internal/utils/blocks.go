@@ -16,18 +16,28 @@ import (
 	"github.com/theQRL/go-zond/core/types"
 )
 
+// CORRECT AND FINAL STRUCTURE - Mirrors the Beacon Node JSON
 type BeaconBlockResponse struct {
-	Data struct {
+	Version string `json:"version"` // <<< ADD THIS FIELD TO MATCH THE JSON
+	Data    struct {
 		Message struct {
 			Slot          string `json:"slot"`
 			ProposerIndex string `json:"proposer_index"`
+			ParentRoot    string `json:"parent_root"`
+			StateRoot     string `json:"state_root"`
 			Body          struct {
-				Graffiti     string `json:"graffiti"`
 				RandaoReveal string `json:"randao_reveal"`
+				Graffiti     string `json:"graffiti"`
 				Eth1Data     struct {
 					DepositCount string `json:"deposit_count"`
 				} `json:"eth1_data"`
-
+				Deposits []struct {
+					Index          string `json:"index"`
+					ValidatorIndex string `json:"validator_index"`
+					FromAddress    string `json:"from_address"`
+					Amount         string `json:"amount"`
+					Timestamp      string `json:"timestamp"`
+				} `json:"deposits"`
 				ExecutionPayload struct {
 					ParentHash       string `json:"parent_hash"`
 					FeeRecipient     string `json:"fee_recipient"`
@@ -44,8 +54,12 @@ type BeaconBlockResponse struct {
 					BlockHash        string `json:"block_hash"`
 					TransactionsRoot string `json:"transactions_root"`
 					PayloadHash      string `json:"payload_hash"`
-					SlotRoot         string `json:"slot_root"`
-					ParentRoot       string `json:"parent_root"`
+					Withdrawals      []struct {
+						Index          string `json:"index"`
+						ValidatorIndex string `json:"validator_index"`
+						Address        string `json:"address"`
+						Amount         string `json:"amount"`
+					} `json:"withdrawals"`
 				} `json:"execution_payload"`
 			} `json:"body"`
 		} `json:"message"`
