@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -14,6 +13,7 @@ import (
 	"zond-indexer/internal/config"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/sirupsen/logrus"
 	"github.com/theQRL/go-zond/zondclient"
 )
 
@@ -96,25 +96,41 @@ func IndexValidators(ctx context.Context, client *zondclient.Client, tx pgx.Tx, 
 	for _, v := range validatorResponse.Data {
 		validatorIndex, err := parseInt(v.Index)
 		if err != nil {
-			log.Printf("Skipping validator with invalid index %s: %v", v.Index, err)
+			// Use Logrus for structured warnings
+			logrus.WithFields(logrus.Fields{
+				"invalid_index": v.Index,
+				"error":         err,
+			}).Warn("Skipping validator with invalid index")
 			continue
 		}
 
 		publicKeyBytes, err := hexToBytes(v.Validator.PublicKey)
 		if err != nil {
-			log.Printf("Skipping validator %s with invalid public key %s: %v", v.Index, v.Validator.PublicKey, err)
+			logrus.WithFields(logrus.Fields{
+				"validator_index": v.Index,
+				"public_key":      v.Validator.PublicKey,
+				"error":           err,
+			}).Warn("Skipping validator with invalid public key")
 			continue
 		}
 
 		withdrawalCredentialsBytes, err := hexToBytes(v.Validator.WithdrawalCredentials)
 		if err != nil {
-			log.Printf("Skipping validator %s with invalid withdrawal credentials %s: %v", v.Index, v.Validator.WithdrawalCredentials, err)
+			logrus.WithFields(logrus.Fields{
+				"validator_index":        v.Index,
+				"withdrawal_credentials": v.Validator.WithdrawalCredentials,
+				"error":                  err,
+			}).Warn("Skipping validator with invalid withdrawal credentials")
 			continue
 		}
 
 		effectiveBalance, err := parseInt(v.Validator.EffectiveBalance)
 		if err != nil {
-			log.Printf("Skipping validator %s with invalid effective balance %s: %v", v.Index, v.Validator.EffectiveBalance, err)
+			logrus.WithFields(logrus.Fields{
+				"validator_index":   v.Index,
+				"effective_balance": v.Validator.EffectiveBalance,
+				"error":             err,
+			}).Warn("Skipping validator with invalid effective balance")
 			continue
 		}
 
@@ -158,11 +174,16 @@ func IndexValidators(ctx context.Context, client *zondclient.Client, tx pgx.Tx, 
 				nil, // reverted_at
 			)
 			if err != nil {
-				log.Printf("Failed to insert validator %s: %v", v.Index, err)
+				// Use Logrus for structured errors
+				logrus.WithFields(logrus.Fields{
+					"validator_index": v.Index,
+					"error":           err,
+				}).Error("Failed to insert new validator")
 				continue
 			}
 			newValidators++
-			log.Printf("Added new validator %s with status %s", v.Index, v.Status)
+			// We remove the chatty log from inside the loop
+			// log.Printf("Added new validator %s with status %s", v.Index, v.Status)
 		} else {
 			// Check if any field has changed
 			if !bytesEqual(existingData.PublicKey, newData.PublicKey) ||
@@ -183,20 +204,37 @@ func IndexValidators(ctx context.Context, client *zondclient.Client, tx pgx.Tx, 
 					time.Now(),
 					validatorIndex)
 				if err != nil {
-					log.Printf("Failed to update validator %s: %v", v.Index, err)
+					// Use Logrus for structured errors
+					logrus.WithFields(logrus.Fields{
+						"validator_index": v.Index,
+						"error":           err,
+					}).Error("Failed to update validator")
 					continue
 				}
 				updatedValidators++
-				log.Printf("Updated validator %s: status=%s, effective_balance=%d", v.Index, newData.Status, newData.EffectiveBalance)
+				// We remove the chatty log from inside the loop
+				// log.Printf("Updated validator %s: status=%s, effective_balance=%d", v.Index, newData.Status, newData.EffectiveBalance)
 			}
 		}
 	}
 
-	// Log the summary
+	// --- Log the Summary using Logrus ---
+
+	// Convert the map to logrus.Fields for structured logging
+	statusFields := make(logrus.Fields)
 	for status, count := range statusCount {
-		log.Printf("Validators: %d %s", count, status)
+		statusFields[status] = count
 	}
-	log.Printf("Processed %d validators: %d new, %d updated", len(validatorResponse.Data), newValidators, updatedValidators)
+
+	// Log the status breakdown
+	logrus.WithFields(statusFields).Info("Validator status summary")
+
+	// Log the processing summary
+	logrus.WithFields(logrus.Fields{
+		"total_processed": len(validatorResponse.Data),
+		"new_count":       newValidators,
+		"updated_count":   updatedValidators,
+	}).Info("Processed validators")
 
 	return nil
 }

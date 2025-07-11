@@ -46,11 +46,19 @@ func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Clien
 			bf := baseFee.Int64()
 			baseFeePerGas = &bf
 		} else {
-			return fmt.Errorf("base_fee_per_gas for block %d is too large for int64: %s", blockNum, baseFee.String())
+			log.Printf("Warning: base_fee_per_gas for block %d is too large for int64: %s. Storing as nil.", blockNum, baseFee.String())
+			baseFeePerGas = nil
 		}
 
-		totalTip := big.NewInt(0)
 		totalGasUsed := uint64(0)
+		for _, tx := range block.Transactions() {
+			totalGasUsed += tx.Gas()
+		}
+		burnt := new(big.Int).Mul(baseFee, new(big.Int).SetUint64(totalGasUsed))
+		burntFloat, _ := new(big.Float).Quo(new(big.Float).SetInt(burnt), new(big.Float).SetInt64(1e18)).Float64()
+		burntFeesEth = burntFloat
+
+		totalTip := big.NewInt(0)
 
 		for _, tx := range block.Transactions() {
 			gasUsed := tx.Gas()
@@ -62,15 +70,14 @@ func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Clien
 			totalGasUsed += gasUsed
 		}
 
-		burnt := new(big.Int).Mul(baseFee, new(big.Int).SetUint64(totalGasUsed))
-
-		burntFloat, _ := new(big.Float).Quo(new(big.Float).SetInt(burnt), big.NewFloat(1e18)).Float64()
-		rewardFloat, _ := new(big.Float).Quo(new(big.Float).SetInt(totalTip), big.NewFloat(1e18)).Float64()
+		rewardFloat, _ := new(big.Float).Quo(new(big.Float).SetInt(totalTip), new(big.Float).SetInt64(1e18)).Float64()
 		rewardEth = rewardFloat
-		burntFeesEth = burntFloat
-
 	} else {
-		return fmt.Errorf("base_fee_per_gas is nil for block %d", blockNum)
+		log.Printf("Block %d: base_fee_per_gas is nil (pre-London block). Defaulting values to 0.", blockNum)
+		bf := int64(0)
+		baseFeePerGas = &bf
+		burntFeesEth = 0
+		rewardEth = 0
 	}
 
 	gasUsedStr := strconv.FormatUint(block.GasUsed(), 10)
@@ -113,8 +120,16 @@ func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Clien
 	mevTxHashBytes := mevTxHash
 	slotRoot := utils.HexToBytes(beaconResp.Data.Message.StateRoot)
 	parentRoot := utils.HexToBytes(beaconResp.Data.Message.ParentRoot)
-	beaconDepositCount := beaconResp.Data.Message.Body.Eth1Data.DepositCount
 	epoch := int64(slot / 32)
+
+	var beaconDepositCountInt64 int64
+	if beaconResp.Data.Message.Body.Eth1Data.DepositCount != "" {
+		parsedVal, err := strconv.ParseInt(beaconResp.Data.Message.Body.Eth1Data.DepositCount, 10, 64)
+		if err != nil {
+			return fmt.Errorf("error parsing beacon_deposit_count '%s': %w", beaconResp.Data.Message.Body.Eth1Data.DepositCount, err)
+		}
+		beaconDepositCountInt64 = parsedVal
+	}
 
 	const insertBlockSQL = `
 	INSERT INTO Blocks (
@@ -173,7 +188,7 @@ func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Clien
 		baseFeePerGas, txRootBytes, stateRootBytes, receiptsRootBytes,
 		logsBloomBytes, chainID.Int64(), "zond_node",
 		slot, epoch, proposerIndex, graffitiBytes, randaoReveal,
-		beaconDepositCount, slotRoot, parentRoot,
+		beaconDepositCountInt64, slotRoot, parentRoot,
 		mevFeeRecipientBytes, mevRewardEth, mevTxHashBytes,
 		rewardEth, burntFeesEth,
 	}
@@ -375,7 +390,7 @@ func insertTransactions(
 			receipt.Status == 1,
 			"zond_node",
 			canonical,
-			block.Time(),
+			time.Unix(int64(block.Time()), 0),
 			isContract,
 			method,
 		)
