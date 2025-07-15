@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"zond-indexer/internal/utils"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/theQRL/go-zond/common"
 	"github.com/theQRL/go-zond/core/types"
@@ -19,17 +21,33 @@ import (
 
 // IndexToken indexes a token contract based on its type
 func IndexToken(ctx context.Context, client *rpc.Client, tx pgx.Tx, addr common.Address, blockNum uint64, canonical bool, tokenType string) error {
-	name, err := callContractRaw(ctx, client, addr, "name()")
+	// --- THE FINAL, DEFINITIVE FIX ---
+	// Before we can insert into the `tokens` table, we MUST ensure the contract's address
+	// exists in the `accounts` table to satisfy the foreign key constraint.
+	_, err := tx.Exec(ctx,
+		`INSERT INTO accounts (address, balance, nonce, is_contract, code, first_seen, last_seen, retrieved_from)
+		 VALUES ($1, '0', 0, true, '', NOW(), NOW(), 'zond-indexer-placeholder')
+		 ON CONFLICT (address) DO NOTHING`,
+		addr.Bytes())
 	if err != nil {
-		return fmt.Errorf("fetch name: %w", err)
+		return fmt.Errorf("ensure token contract account %s exists: %w", addr.Hex(), err)
 	}
-	nameStr := name
+	// --- END OF FIX ---
 
-	symbol, err := callContractRaw(ctx, client, addr, "symbol()")
+	// Now that the account is guaranteed to exist, we can proceed with fetching token details.
+	nameBytes, err := callContractRaw(ctx, client, addr, "name()")
 	if err != nil {
-		return fmt.Errorf("fetch symbol: %w", err)
+		log.Printf("Could not fetch name for token %s: %v", addr.Hex(), err)
+		nameBytes = []byte{}
 	}
-	symbolStr := symbol
+	nameStr := utils.SanitizeString(string(nameBytes))
+
+	symbolBytes, err := callContractRaw(ctx, client, addr, "symbol()")
+	if err != nil {
+		log.Printf("Could not fetch symbol for token %s: %v", addr.Hex(), err)
+		symbolBytes = []byte{}
+	}
+	symbolStr := utils.SanitizeString(string(symbolBytes))
 
 	decimals := 0
 	if tokenType == "ERC20" {
@@ -42,15 +60,16 @@ func IndexToken(ctx context.Context, client *rpc.Client, tx pgx.Tx, addr common.
 		}
 	}
 
-	totalSupplyStr := "0"
+	totalSupply := "0"
 	if tokenType == "ERC20" {
 		supplyBytes, err := callContractRaw(ctx, client, addr, "totalSupply()")
 		if err == nil && len(supplyBytes) > 0 {
 			supplyBig := new(big.Int).SetBytes(supplyBytes)
-			totalSupplyStr = supplyBig.String()
+			totalSupply = supplyBig.String()
 		}
 	}
 
+	// This INSERT will now succeed because the foreign key dependency has been met.
 	_, err = tx.Exec(ctx,
 		`INSERT INTO Tokens (
 			contract_address, token_name, token_symbol, total_supply, decimals, token_type,
@@ -63,21 +82,10 @@ func IndexToken(ctx context.Context, client *rpc.Client, tx pgx.Tx, addr common.
 			logo = EXCLUDED.logo, is_canonical = EXCLUDED.is_canonical,
 			retrieved_at = EXCLUDED.retrieved_at, retrieved_from = EXCLUDED.retrieved_from,
 			reverted_at = EXCLUDED.reverted_at`,
-		addr.Bytes(),
-		nameStr,
-		symbolStr,
-		totalSupplyStr,
-		decimals,
-		tokenType,
-		"",
-		"",
-		canonical,
-		time.Now(),
-		"zond_node",
-		nil,
+		addr.Bytes(), nameStr, symbolStr, totalSupply, decimals, tokenType, "", "", canonical, time.Now(), "zond_node", nil,
 	)
 	if err != nil {
-		return fmt.Errorf("insert token %s: %w", addr.Hex(), err)
+		return fmt.Errorf("insert token %s (name: %q, symbol: %q): %w", addr.Hex(), nameStr, symbolStr, err)
 	}
 
 	return nil
@@ -85,108 +93,80 @@ func IndexToken(ctx context.Context, client *rpc.Client, tx pgx.Tx, addr common.
 
 // IndexTokenTransactionsAndNFTs indexes token transactions and NFTs for a transaction
 func IndexTokenTransactionsAndNFTs(ctx context.Context, client *rpc.Client, tx pgx.Tx, transaction *types.Transaction, receipt *types.Receipt, blockNum uint64, canonical bool) error {
+	transferEventSig := common.HexToHash("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+
 	for _, txLog := range receipt.Logs {
-		if len(txLog.Topics) == 0 {
+		if len(txLog.Topics) < 3 || txLog.Topics[0] != transferEventSig {
 			continue
 		}
 
-		// Check for ERC20 Transfer event
-		transferEventSig := common.HexToHash("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
-		if txLog.Topics[0] == transferEventSig && len(txLog.Topics) == 4 {
-			if len(txLog.Topics[1]) != 32 || len(txLog.Topics[2]) != 32 || len(txLog.Topics[3]) != 32 {
-				continue
-			}
+		if len(txLog.Topics) == 3 {
+			tokenAddress := txLog.Address
 
-			fromAddr := common.BytesToAddress(txLog.Topics[1][12:])
-			toAddr := common.BytesToAddress(txLog.Topics[2][12:])
-			value := new(big.Int).SetBytes(txLog.Topics[3][:])
-
-			_, err := tx.Exec(ctx,
-				`INSERT INTO TokenTransactions (
-					tx_hash, contract_address, from_address, to_address, token_id, value,
-					is_canonical, retrieved_at, retrieved_from, reverted_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-				ON CONFLICT (tx_hash, contract_address, from_address, to_address, token_id) DO UPDATE
-				SET value = EXCLUDED.value, is_canonical = EXCLUDED.is_canonical,
-					retrieved_at = EXCLUDED.retrieved_at, retrieved_from = EXCLUDED.retrieved_from,
-					reverted_at = EXCLUDED.reverted_at`,
-				transaction.Hash().Bytes(),
-				txLog.Address.Bytes(),
-				fromAddr.Bytes(),
-				toAddr.Bytes(),
-				"", // token_id (empty for ERC20)
-				value.Int64(),
-				canonical,
-				time.Now(),
-				"zond_node",
-				nil, // reverted_at
-			)
+			// This part is now correct: Ensure the token's own record exists first.
+			err := IndexToken(ctx, client, tx, tokenAddress, blockNum, canonical, "ERC20")
 			if err != nil {
-				return fmt.Errorf("insert token transaction: %w", err)
+				return fmt.Errorf("failed to ensure token %s exists: %w", tokenAddress.Hex(), err)
 			}
-		}
 
-		// Check for ERC721 or ERC1155 Transfer events
-		transferSingleSig := common.HexToHash("0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f")
-		if (txLog.Topics[0] == transferEventSig && len(txLog.Topics) == 4) || (txLog.Topics[0] == transferSingleSig && len(txLog.Topics) == 4) {
-			isERC721 := txLog.Topics[0] == transferEventSig
-			isERC1155 := txLog.Topics[0] == transferSingleSig
-
-			var tokenID *big.Int
-			var toAddr common.Address
-
-			if isERC721 {
-				tokenID = new(big.Int).SetBytes(txLog.Topics[3][:])
-				toAddr = common.BytesToAddress(txLog.Topics[2][12:])
-			} else if isERC1155 {
-				if len(txLog.Data) < 64 {
-					continue
-				}
-				tokenID = new(big.Int).SetBytes(txLog.Data[:32])
-				toAddr = common.BytesToAddress(txLog.Topics[3][12:])
-			} else {
+			if len(txLog.Data) != 32 {
+				log.Printf("Warning: Invalid ERC-20 Transfer data length in tx %s", transaction.Hash().Hex())
 				continue
+			}
+
+			fromAddr := common.BytesToAddress(txLog.Topics[1][:])
+			toAddr := common.BytesToAddress(txLog.Topics[2][:])
+			value := new(big.Int).SetBytes(txLog.Data)
+
+			// --- THE FINAL, DEFINITIVE FIX ---
+			// Ensure both the 'from' and 'to' accounts exist in the `accounts` table
+			// before we try to create a token balance for them. This satisfies the foreign key constraint.
+			accountsToEnsure := []common.Address{fromAddr, toAddr}
+			for _, acc := range accountsToEnsure {
+				if acc != (common.Address{}) {
+					// This quick query creates a placeholder account record if it doesn't exist.
+					_, err := tx.Exec(ctx,
+						`INSERT INTO accounts (address, balance, nonce, is_contract, code, first_seen, last_seen, retrieved_from)
+						 VALUES ($1, '0', 0, false, '', NOW(), NOW(), 'zond-indexer-placeholder')
+						 ON CONFLICT (address) DO NOTHING`,
+						acc.Bytes())
+					if err != nil {
+						return fmt.Errorf("ensure account %s exists in accounts table: %w", acc.Hex(), err)
+					}
+				}
+			}
+			// --- END OF FIX ---
+
+			// Now that the accounts are guaranteed to exist, update their balances.
+			if fromAddr != (common.Address{}) {
+				// Ensure the from_address exists in the tokenbalances table (for the subtraction)
+				_, err := tx.Exec(ctx, `INSERT INTO tokenbalances (address, token_address, balance) VALUES ($1, $2, 0) ON CONFLICT DO NOTHING;`, fromAddr.Bytes(), tokenAddress.Bytes())
+				if err != nil {
+					return fmt.Errorf("ensure from_account exists in tokenbalances: %w", err)
+				}
+
+				// Now subtract
+				_, err = tx.Exec(ctx, `UPDATE tokenbalances SET balance = balance - $1 WHERE address = $2 AND token_address = $3`, value.String(), fromAddr.Bytes(), tokenAddress.Bytes())
+				if err != nil {
+					return fmt.Errorf("update from_address balance: %w", err)
+				}
 			}
 
 			if toAddr != (common.Address{}) {
-				metadata, err := fetchNFTMetadata(ctx, client, txLog.Address, tokenID)
+				// Use ON CONFLICT to safely handle new or existing receivers
+				_, err := tx.Exec(ctx, `INSERT INTO tokenbalances (address, token_address, balance) VALUES ($1, $2, $3) ON CONFLICT (address, token_address) DO UPDATE SET balance = tokenbalances.balance + EXCLUDED.balance;`, toAddr.Bytes(), tokenAddress.Bytes(), value.String())
 				if err != nil {
-					log.Printf("Block %d: Failed to fetch NFT metadata for token %s ID %s: %v", blockNum, txLog.Address.Hex(), tokenID.String(), err)
+					return fmt.Errorf("update to_address balance: %w", err)
 				}
+			}
 
-				metadataJSON, err := json.Marshal(metadata)
-				if err != nil {
-					log.Printf("Block %d: Failed to marshal NFT metadata for token %s ID %s: %v", blockNum, txLog.Address.Hex(), tokenID.String(), err)
-					metadataJSON = []byte("{}")
-				}
-
-				_, err = tx.Exec(ctx,
-					`INSERT INTO NFTs (
-						contract_address, token_id, token_uri, owner, metadata,
-						is_canonical, retrieved_at, retrieved_from, reverted_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-					ON CONFLICT (contract_address, token_id) DO UPDATE
-					SET owner = EXCLUDED.owner, token_uri = EXCLUDED.token_uri,
-						metadata = EXCLUDED.metadata, is_canonical = EXCLUDED.is_canonical,
-						retrieved_at = EXCLUDED.retrieved_at, retrieved_from = EXCLUDED.retrieved_from,
-						reverted_at = EXCLUDED.reverted_at`,
-					txLog.Address.Bytes(),
-					tokenID.String(),
-					metadata.TokenURI,
-					toAddr.Bytes(),
-					metadataJSON,
-					canonical,
-					time.Now(),
-					"zond_node",
-					nil,
-				)
-				if err != nil {
-					return fmt.Errorf("insert NFT: %w", err)
-				}
+			// Also insert into tokentransactions...
+			_, err = tx.Exec(ctx, `INSERT INTO tokentransactions (tx_hash, log_index, contract_address, from_address, to_address, value, token_id) VALUES ($1, $2, $3, $4, $5, $6, NULL)`, transaction.Hash().Bytes(), txLog.Index, tokenAddress.Bytes(), fromAddr.Bytes(), toAddr.Bytes(), value.String())
+			if err != nil {
+				return fmt.Errorf("insert into tokentransactions: %w", err)
 			}
 		}
 	}
-
 	return nil
 }
 

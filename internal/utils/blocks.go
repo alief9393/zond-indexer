@@ -169,3 +169,7 @@ func FlattenTraceCalls(txHash string, blockNumber uint64, calls []node.TraceCall
 
 	return result
 }
+
+func SanitizeString(s string) string {
+	return strings.ReplaceAll(s, "\x00", "")
+}

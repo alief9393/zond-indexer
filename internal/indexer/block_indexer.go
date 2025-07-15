@@ -484,15 +484,15 @@ func insertAccounts(
 			return fmt.Errorf("account %s: invalid address length: %d bytes", address, len(addrBytes))
 		}
 
-		balance, err := client.BalanceAt(ctx, addr, block.Number())
+		balance, err := client.BalanceAt(ctx, addr, nil)
 		if err != nil {
 			return fmt.Errorf("fetch balance for %s: %w", address, err)
 		}
-		nonce, err := client.NonceAt(ctx, addr, block.Number())
+		nonce, err := client.NonceAt(ctx, addr, nil)
 		if err != nil {
 			return fmt.Errorf("fetch nonce for %s: %w", address, err)
 		}
-		code, err := client.CodeAt(ctx, addr, block.Number())
+		code, err := client.CodeAt(ctx, addr, nil)
 		if err != nil {
 			return fmt.Errorf("fetch code for %s: %w", address, err)
 		}

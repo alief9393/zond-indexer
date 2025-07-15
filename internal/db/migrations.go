@@ -112,6 +112,24 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
 		return fmt.Errorf("create beacon_deposits table: %w", err)
 	}
 
+	_, err = tx.Exec(ctx, `
+    CREATE TABLE IF NOT EXISTS token_market_data (
+        contract_address type_address PRIMARY KEY REFERENCES tokens(contract_address) ON DELETE CASCADE,
+        price_usd NUMERIC(30, 10),
+        price_in_native NUMERIC(30, 18), -- Price in ZND
+        volume_24h_usd NUMERIC(40, 10),
+        price_change_24h_percent NUMERIC(10, 4),
+        circulating_market_cap_usd NUMERIC(40, 10),
+        onchain_market_cap_usd NUMERIC(40, 10),
+        circulating_supply NUMERIC(78, 0),
+        source VARCHAR(50),
+        last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+`)
+	if err != nil {
+		return fmt.Errorf("create token_market_data table: %w", err)
+	}
+
 	// Other tables (unchanged but using lowercase names for consistency)
 	_, err = tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(255) UNIQUE NOT NULL, email VARCHAR(255) UNIQUE NOT NULL, password TEXT NOT NULL, is_paid BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`)
 	if err != nil {
@@ -125,7 +143,7 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
 	if err != nil {
 		return fmt.Errorf("create contracts table: %w", err)
 	}
-	_, err = tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS tokens (contract_address type_address PRIMARY KEY REFERENCES accounts(address), token_name VARCHAR(255) NOT NULL, token_symbol VARCHAR(50) NOT NULL, total_supply BIGINT CHECK (total_supply >= 0) NOT NULL, decimals INT NOT NULL, token_type VARCHAR(50) NOT NULL, website VARCHAR(255), logo VARCHAR(255), is_canonical BOOLEAN DEFAULT TRUE, retrieved_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, retrieved_from VARCHAR, reverted_at TIMESTAMP WITH TIME ZONE);`)
+	_, err = tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS tokens (contract_address type_address PRIMARY KEY REFERENCES accounts(address), token_name VARCHAR(255) NOT NULL, token_symbol VARCHAR(50) NOT NULL, total_supply NUMERIC(78, 0) NOT NULL,, decimals INT NOT NULL, token_type VARCHAR(50) NOT NULL, website VARCHAR(255), logo VARCHAR(255), is_canonical BOOLEAN DEFAULT TRUE, retrieved_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, retrieved_from VARCHAR, reverted_at TIMESTAMP WITH TIME ZONE);`)
 	if err != nil {
 		return fmt.Errorf("create tokens table: %w", err)
 	}
