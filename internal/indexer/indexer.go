@@ -139,7 +139,7 @@ func (i *Indexer) Run(ctx context.Context) error {
 		return fmt.Errorf("🚧 node is not fully synced: current=%d highest=%d", syncing.CurrentBlock, syncing.HighestBlock)
 	}
 	logger.Logger.Info("✅ Node is fully synced")
-
+	go i.StartPendingTxWatcher(ctx)
 	var lastIndexedBlock int64
 	err = i.db.QueryRow(ctx, `SELECT COALESCE(MAX(block_number), -1) FROM Blocks WHERE canonical = TRUE`).Scan(&lastIndexedBlock)
 	if err != nil {

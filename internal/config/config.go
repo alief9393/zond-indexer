@@ -8,19 +8,21 @@ import (
 )
 
 type Config struct {
-	RPCEndpoint  string
-	PostgresConn string
-	RateLimit    time.Duration
-	BeaconHost   string
-	BeaconPort   int
+	RPCEndpoint     string
+	PostgresConn    string
+	RateLimit       time.Duration
+	BeaconHost      string
+	BeaconPort      int
+	RPCEndpointHttp string
 }
 
 // LoadConfig loads the configuration from environment variables
 func LoadConfig() (Config, error) {
 	cfg := Config{
-		RPCEndpoint:  getEnv("RPC_ENDPOINT", ""),
-		PostgresConn: getEnv("POSTGRES_CONN", ""),
-		BeaconHost:   getEnv("BEACON_HOST", "localhost"),
+		RPCEndpoint:     getEnv("RPC_ENDPOINT", ""),
+		PostgresConn:    getEnv("POSTGRES_CONN", ""),
+		BeaconHost:      getEnv("BEACON_HOST", "localhost"),
+		RPCEndpointHttp: getEnv("RPCEndpointHttp", ""),
 	}
 
 	// Parse the beacon port

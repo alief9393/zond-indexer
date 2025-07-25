@@ -17,6 +17,7 @@ type BeaconDeposit struct {
 	FromAddress    string `json:"from_address"`
 	Amount         string `json:"amount"`
 	Timestamp      string `json:"timestamp"`
+	TxHash         string `json:"tx_hash"`
 }
 
 // InsertBeaconDeposits inserts a slice of beacon deposits into the database.
@@ -30,15 +31,16 @@ func InsertBeaconDeposits(ctx context.Context, tx pgx.Tx, blockNumber uint64, de
 		index, _ := strconv.ParseInt(d.Index, 10, 64)
 		validatorIndex, _ := strconv.Atoi(d.ValidatorIndex)
 		fromBytes := utils.MustHexToAddressBytes(d.FromAddress)
+		txHashBytes := utils.MustHexToAddressBytes(d.TxHash)
 		ts, _ := strconv.ParseInt(d.Timestamp, 10, 64)
 		timestamp := time.Unix(ts, 0)
 
 		const insertDepositSQL = `
-			INSERT INTO beacon_deposits (index, validator_index, block_number, from_address, amount, timestamp)
-			VALUES ($1, $2, $3, $4, $5, $6)
+			INSERT INTO beacon_deposits (index, validator_index, block_number, from_address, amount, timestamp, tx_hash)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
 			ON CONFLICT (block_number, index) DO NOTHING;
 		`
-		batch.Queue(insertDepositSQL, index, validatorIndex, blockNumber, fromBytes, d.Amount, timestamp)
+		batch.Queue(insertDepositSQL, index, validatorIndex, blockNumber, fromBytes, d.Amount, timestamp, txHashBytes)
 	}
 
 	results := tx.SendBatch(ctx, batch)

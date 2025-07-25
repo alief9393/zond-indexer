@@ -37,6 +37,7 @@ type BeaconBlockResponse struct {
 					FromAddress    string `json:"from_address"`
 					Amount         string `json:"amount"`
 					Timestamp      string `json:"timestamp"`
+					TxHash         string `json:"tx_hash"`
 				} `json:"deposits"`
 				ExecutionPayload struct {
 					ParentHash       string `json:"parent_hash"`

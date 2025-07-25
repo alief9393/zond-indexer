@@ -192,6 +192,72 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
 		return fmt.Errorf("create tokenbalances table: %w", err)
 	}
 
+	_, err = tx.Exec(ctx, `
+    CREATE TABLE IF NOT EXISTS pending_transactions (
+        tx_hash BYTEA PRIMARY KEY,
+        from_address type_address NOT NULL,
+        to_address type_address,
+        nonce BIGINT NOT NULL,
+        gas BIGINT NOT NULL,
+        gas_price TEXT NOT NULL,
+        value TEXT NOT NULL,
+        method VARCHAR(10),
+        last_seen TIMESTAMPTZ NOT NULL
+    );
+`)
+	if err != nil {
+		return fmt.Errorf("create pending_transactions table: %w", err)
+	}
+
+	// ADDED: Create address_labels table for known names like "Titan Builder"
+	_, err = tx.Exec(ctx, `
+    CREATE TABLE IF NOT EXISTS address_labels (
+        address type_address PRIMARY KEY,
+        label TEXT NOT NULL
+    );
+`)
+	if err != nil {
+		return fmt.Errorf("create address_labels table: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `ALTER TABLE accounts ADD COLUMN IF NOT EXISTS funder_address type_address;`)
+	if err != nil {
+		return fmt.Errorf("alter accounts table add funder_address: %w", err)
+	}
+	_, err = tx.Exec(ctx, `ALTER TABLE accounts ADD COLUMN IF NOT EXISTS funding_tx_hash BYTEA;`)
+	if err != nil {
+		return fmt.Errorf("alter accounts table add funding_tx_hash: %w", err)
+	}
+	_, err = tx.Exec(ctx, `ALTER TABLE accounts ADD COLUMN IF NOT EXISTS first_tx_sent_timestamp TIMESTAMPTZ;`)
+	if err != nil {
+		return fmt.Errorf("alter accounts table add first_tx_sent_timestamp: %w", err)
+	}
+	_, err = tx.Exec(ctx, `ALTER TABLE accounts ADD COLUMN IF NOT EXISTS last_tx_sent_timestamp TIMESTAMPTZ;`)
+	if err != nil {
+		return fmt.Errorf("alter accounts table add last_tx_sent_timestamp: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS beacon_deposits (
+			index BIGINT NOT NULL,
+			validator_index INT NOT NULL,
+			block_number BIGINT NOT NULL REFERENCES blocks(block_number),
+			from_address type_address NOT NULL,
+			amount TEXT NOT NULL,
+			timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+			tx_hash BYTEA NOT NULL,  -- <<< ADD THIS LINE
+			PRIMARY KEY (block_number, index)
+		);
+	`)
+	if err != nil {
+		return fmt.Errorf("create beacon_deposits table: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `ALTER TABLE beacon_deposits ADD COLUMN IF NOT EXISTS tx_hash BYTEA;`)
+	if err != nil {
+		return fmt.Errorf("alter beacon_deposits table add tx_hash: %w", err)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit transaction: %w", err)
 	}

@@ -25,6 +25,14 @@ import (
 	"github.com/theQRL/go-zond/zondclient"
 )
 
+type accountUpdateData struct {
+	address     string
+	txHash      []byte
+	isSender    bool
+	isReceiver  bool
+	fromAddress []byte
+}
+
 func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Client, rpcClient *rpc.Client, db *pgxpool.Pool, blockNum uint64, chainID *big.Int, canonical bool) error {
 	block, err := client.BlockByNumber(ctx, big.NewInt(int64(blockNum)))
 	if err != nil {
@@ -227,6 +235,7 @@ func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Clien
 					FromAddress:    d.FromAddress,
 					Amount:         d.Amount,
 					Timestamp:      d.Timestamp,
+					TxHash:         d.TxHash,
 				}
 			}
 			if err := dbpkg.InsertBeaconDeposits(ctx, tx, blockNum, dbDeposits); err != nil {
@@ -235,14 +244,14 @@ func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Clien
 		}
 	}
 
-	accounts := make(map[string]bool)
+	accountsToUpdate := make(map[string]accountUpdateData)
 	contracts := make(map[common.Address]bool)
 	tokenContracts := make(map[common.Address]bool)
 	nftContracts := make(map[common.Address]bool)
 
 	minerAddr := block.Coinbase().Hex()
 	if utils.IsValidHexAddress(minerAddr) {
-		accounts[minerAddr] = true
+		accountsToUpdate[minerAddr] = accountUpdateData{address: minerAddr, isReceiver: true}
 	} else {
 		return fmt.Errorf("block %d: invalid miner address format: %s", blockNum, minerAddr)
 	}
@@ -255,12 +264,12 @@ func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Clien
 		log.Printf("Failed to index ZondNodes for block %d: %v", blockNum, err)
 	}
 
-	if err := insertTransactions(ctx, client, rpcClient, tx, block, blockNum, canonical, accounts, contracts, tokenContracts, nftContracts); err != nil {
+	if err := insertTransactions(ctx, client, rpcClient, tx, block, blockNum, canonical, accountsToUpdate, contracts, tokenContracts, nftContracts); err != nil {
 		return fmt.Errorf("insert transactions for block %d: %w", blockNum, err)
 	}
 
 	timestamp := time.Unix(int64(block.Time()), 0)
-	if err := insertAccounts(ctx, client, tx, block, accounts, timestamp); err != nil {
+	if err := insertAccounts(ctx, client, tx, accountsToUpdate, timestamp); err != nil {
 		return fmt.Errorf("insert accounts: %w", err)
 	}
 
@@ -280,7 +289,7 @@ func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Clien
 		return fmt.Errorf("commit transaction: %w", err)
 	}
 
-	log.Printf("Block %d: Miner=%s, Txs=%d, Accounts=%d, Canonical=%t", blockNum, minerAddr, len(block.Transactions()), len(accounts), canonical)
+	log.Printf("Block %d: Miner=%s, Txs=%d, Accounts=%d, Canonical=%t", blockNum, minerAddr, len(block.Transactions()), len(accountsToUpdate), canonical)
 	return nil
 }
 
@@ -292,7 +301,7 @@ func insertTransactions(
 	block *types.Block,
 	blockNum uint64,
 	canonical bool,
-	accounts map[string]bool,
+	accountsToUpdate map[string]accountUpdateData,
 	contracts map[common.Address]bool,
 	tokenContracts map[common.Address]bool,
 	nftContracts map[common.Address]bool,
@@ -398,16 +407,34 @@ func insertTransactions(
 			return fmt.Errorf("insert transaction %s: %w", transaction.Hash().Hex(), err)
 		}
 
+		log.Printf("[Block %d] Transaction %s confirmed. Removing from pending table.", blockNum, transaction.Hash().Hex())
+		// We use the main database transaction `tx` that the block processor is using.
+		if err := dbpkg.DeletePendingTransactionByHash(ctx, tx, transaction.Hash().Bytes()); err != nil {
+			// This is not a critical error, so we just log it and continue.
+			log.Printf("⚠️ [Block %d] Failed to delete pending tx %s: %v", blockNum, transaction.Hash().Hex(), err)
+		}
+
 		fromAddr := from.Hex()
+		txHashBytes := transaction.Hash().Bytes()
 		if utils.IsValidHexAddress(fromAddr) {
-			accounts[fromAddr] = true
+			accountsToUpdate[fromAddr] = accountUpdateData{
+				address:     fromAddr,
+				txHash:      txHashBytes,
+				isSender:    true,
+				fromAddress: fromAddrBytes,
+			}
 		} else {
 			return fmt.Errorf("block %d: invalid from address format: %s", blockNum, fromAddr)
 		}
 
 		if toAddrStr != "" {
 			if utils.IsValidHexAddress(toAddrStr) {
-				accounts[toAddrStr] = true
+				data := accountsToUpdate[toAddrStr]
+				data.address = toAddrStr
+				data.txHash = txHashBytes
+				data.isReceiver = true
+				data.fromAddress = fromAddrBytes
+				accountsToUpdate[toAddrStr] = data
 			} else {
 				return fmt.Errorf("block %d: invalid to address format: %s", blockNum, toAddrStr)
 			}
@@ -421,7 +448,12 @@ func insertTransactions(
 			}
 			contractAddrStr := contractAddr.Hex()
 			if utils.IsValidHexAddress(contractAddrStr) {
-				accounts[contractAddrStr] = true
+				accountsToUpdate[contractAddrStr] = accountUpdateData{
+					address:     contractAddrStr,
+					txHash:      txHashBytes,
+					isReceiver:  true,
+					fromAddress: fromAddrBytes,
+				}
 				contracts[contractAddr] = true
 
 				isToken, tokenType, err := token.DetectTokenContract(ctx, rpcClient, contractAddr)
@@ -469,11 +501,10 @@ func insertAccounts(
 	ctx context.Context,
 	client *zondclient.Client,
 	tx pgx.Tx,
-	block *types.Block,
-	accounts map[string]bool,
+	accountsToUpdate map[string]accountUpdateData,
 	timestamp time.Time,
 ) error {
-	for address := range accounts {
+	for address, data := range accountsToUpdate {
 		addr, err := utils.HexToAddress(address)
 		if err != nil {
 			return fmt.Errorf("convert address %s: %w", address, err)
@@ -497,24 +528,35 @@ func insertAccounts(
 			return fmt.Errorf("fetch code for %s: %w", address, err)
 		}
 
-		var existingBalance string
-		var existingNonce int
-		err = tx.QueryRow(ctx,
-			`SELECT balance, nonce FROM Accounts WHERE address = $1`,
-			addrBytes).Scan(&existingBalance, &existingNonce)
-		if err != nil && err != pgx.ErrNoRows {
+		// Check if the account exists to determine if it's the first time we've seen it.
+		var exists bool
+		err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM Accounts WHERE address = $1)`, addrBytes).Scan(&exists)
+		if err != nil {
 			return fmt.Errorf("check existing account %s: %w", address, err)
 		}
 
 		balanceStr := balance.String()
 		nonceInt := int(nonce)
-		if err == pgx.ErrNoRows || existingBalance != balanceStr || existingNonce != nonceInt {
+
+		if !exists {
+			// This is a brand new account.
+			funderAddress := []byte(nil)
+			fundingTxHash := []byte(nil)
+			firstTxSentTimestamp := (*time.Time)(nil)
+
+			if data.isReceiver {
+				funderAddress = data.fromAddress
+				fundingTxHash = data.txHash
+			}
+			if data.isSender {
+				firstTxSentTimestamp = &timestamp
+			}
+
 			_, err = tx.Exec(ctx,
 				`INSERT INTO Accounts (
-					address, balance, nonce, is_contract, code, first_seen, last_seen, retrieved_from
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-				ON CONFLICT (address) DO UPDATE
-				SET balance = $2, nonce = $3, last_seen = $7`,
+					address, balance, nonce, is_contract, code, first_seen, last_seen, retrieved_from,
+					funder_address, funding_tx_hash, first_tx_sent_timestamp, last_tx_sent_timestamp
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 				addrBytes,
 				balanceStr,
 				nonceInt,
@@ -522,9 +564,41 @@ func insertAccounts(
 				hex.EncodeToString(code),
 				timestamp,
 				timestamp,
-				"zond_node")
+				"zond_node",
+				funderAddress,
+				fundingTxHash,
+				firstTxSentTimestamp,
+				&timestamp, // last_tx_sent is always now
+			)
 			if err != nil {
-				return fmt.Errorf("insert account %s: %w", address, err)
+				return fmt.Errorf("insert new account %s: %w", address, err)
+			}
+		} else {
+			// The account already exists, so we update it.
+			// We only update first_tx_sent_timestamp if it's NULL and this is a send operation.
+			var updateQuery string
+			if data.isSender {
+				updateQuery = `
+					UPDATE Accounts SET
+						balance = $1,
+						nonce = $2,
+						last_seen = $3,
+						last_tx_sent_timestamp = $3,
+						first_tx_sent_timestamp = COALESCE(first_tx_sent_timestamp, $3)
+					WHERE address = $4`
+			} else {
+				// If it's just a receiver, we only update balance and last_seen.
+				updateQuery = `
+					UPDATE Accounts SET
+						balance = $1,
+						nonce = $2,
+						last_seen = $3
+					WHERE address = $4`
+			}
+
+			_, err = tx.Exec(ctx, updateQuery, balanceStr, nonceInt, timestamp, addrBytes)
+			if err != nil {
+				return fmt.Errorf("update existing account %s: %w", address, err)
 			}
 		}
 	}
