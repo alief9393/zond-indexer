@@ -40,10 +40,10 @@ type Indexer struct {
 func NewIndexer(config config.Config) (*Indexer, error) {
 	log := logger.Logger
 
-	log.Infof("🔌 Connecting to RPC endpoint: %s", config.RPCEndpoint)
-	rpcClient, err := rpc.Dial(config.RPCEndpoint)
+	log.Infof("🔌 Connecting to WS endpoint: %s", config.WSEndpoint)
+	rpcClient, err := rpc.Dial(config.WSEndpoint)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to RPC endpoint: %w", err)
+		return nil, fmt.Errorf("failed to connect to WS endpoint: %w", err)
 	}
 	client := zondclient.NewClient(rpcClient)
 
