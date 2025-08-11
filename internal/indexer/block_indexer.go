@@ -229,13 +229,21 @@ func indexBlock(ctx context.Context, cfg config.Config, client *zondclient.Clien
 		if len(deposits) > 0 {
 			dbDeposits := make([]dbpkg.BeaconDeposit, len(deposits))
 			for i, d := range deposits {
+				timestampUnix, err := strconv.ParseInt(d.Timestamp, 10, 64)
+				if err != nil {
+					log.Printf("Could not parse timestamp for deposit: %v", err)
+					continue
+				}
+				parsedTimestamp := time.Unix(timestampUnix, 0)
 				dbDeposits[i] = dbpkg.BeaconDeposit{
 					Index:          d.Index,
 					ValidatorIndex: d.ValidatorIndex,
 					FromAddress:    d.FromAddress,
 					Amount:         d.Amount,
-					Timestamp:      d.Timestamp,
+					Timestamp:      parsedTimestamp,
 					TxHash:         d.TxHash,
+					PubKey:         d.PubKey,
+					Signature:      d.Signature,
 				}
 			}
 			if err := dbpkg.InsertBeaconDeposits(ctx, tx, blockNum, dbDeposits); err != nil {

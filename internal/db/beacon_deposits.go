@@ -2,8 +2,10 @@ package db
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 	"zond-indexer/internal/utils"
 
@@ -12,12 +14,14 @@ import (
 
 // BeaconDeposit represents the structure of a single beacon deposit.
 type BeaconDeposit struct {
-	Index          string `json:"index"`
-	ValidatorIndex string `json:"validator_index"`
-	FromAddress    string `json:"from_address"`
-	Amount         string `json:"amount"`
-	Timestamp      string `json:"timestamp"`
-	TxHash         string `json:"tx_hash"`
+	Index          string    `json:"index"`
+	ValidatorIndex string    `json:"validator_index"`
+	Amount         string    `json:"amount"`
+	TxHash         string    `json:"tx_hash"`
+	FromAddress    string    `json:"from_address"`
+	PubKey         string    `json:"pubkey"`
+	Signature      string    `json:"signature"`
+	Timestamp      time.Time `json:"timestamp"`
 }
 
 // InsertBeaconDeposits inserts a slice of beacon deposits into the database.
@@ -31,16 +35,16 @@ func InsertBeaconDeposits(ctx context.Context, tx pgx.Tx, blockNumber uint64, de
 		index, _ := strconv.ParseInt(d.Index, 10, 64)
 		validatorIndex, _ := strconv.Atoi(d.ValidatorIndex)
 		fromBytes := utils.MustHexToAddressBytes(d.FromAddress)
-		txHashBytes := utils.MustHexToAddressBytes(d.TxHash)
-		ts, _ := strconv.ParseInt(d.Timestamp, 10, 64)
-		timestamp := time.Unix(ts, 0)
+		txHashBytes, _ := hex.DecodeString(strings.TrimPrefix(d.TxHash, "0x"))
+		pubKeyBytes, _ := hex.DecodeString(strings.TrimPrefix(d.PubKey, "0x"))
+		sigBytes, _ := hex.DecodeString(strings.TrimPrefix(d.Signature, "0x"))
 
 		const insertDepositSQL = `
-			INSERT INTO beacon_deposits (index, validator_index, block_number, from_address, amount, timestamp, tx_hash)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			INSERT INTO beacon_deposits (index, validator_index, block_number, from_address, amount, timestamp, tx_hash, pubkey, signature)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 			ON CONFLICT (block_number, index) DO NOTHING;
 		`
-		batch.Queue(insertDepositSQL, index, validatorIndex, blockNumber, fromBytes, d.Amount, timestamp, txHashBytes)
+		batch.Queue(insertDepositSQL, index, validatorIndex, blockNumber, fromBytes, d.Amount, d.Timestamp, txHashBytes, pubKeyBytes, sigBytes)
 	}
 
 	results := tx.SendBatch(ctx, batch)

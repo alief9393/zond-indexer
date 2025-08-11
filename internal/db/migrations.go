@@ -220,24 +220,22 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
 	}
 
 	_, err = tx.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS beacon_deposits (
-			index BIGINT NOT NULL,
-			validator_index INT NOT NULL,
-			block_number BIGINT NOT NULL REFERENCES blocks(block_number),
-			from_address type_address NOT NULL,
-			amount TEXT NOT NULL,
-			timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
-			tx_hash BYTEA NOT NULL,  -- <<< ADD THIS LINE
-			PRIMARY KEY (block_number, index)
-		);
+    CREATE TABLE IF NOT EXISTS beacon_deposits (
+		index BIGINT NOT NULL,
+		block_number BIGINT NOT NULL REFERENCES blocks(block_number),
+		tx_hash BYTEA UNIQUE NOT NULL,        
+		from_address type_address NOT NULL,
+		validator_index INT NOT NULL,
+		pubkey BYTEA NOT NULL,                 
+		signature BYTEA NOT NULL,              
+		amount TEXT NOT NULL,
+		"valid" BOOLEAN DEFAULT TRUE,       
+		timestamp TIMESTAMPTZ NOT NULL,
+		PRIMARY KEY (block_number, index)
+	);
 	`)
 	if err != nil {
 		return fmt.Errorf("create beacon_deposits table: %w", err)
-	}
-
-	_, err = tx.Exec(ctx, `ALTER TABLE beacon_deposits ADD COLUMN IF NOT EXISTS tx_hash BYTEA;`)
-	if err != nil {
-		return fmt.Errorf("alter beacon_deposits table add tx_hash: %w", err)
 	}
 
 	_, err = tx.Exec(ctx, `
