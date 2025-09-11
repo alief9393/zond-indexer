@@ -165,9 +165,16 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
 	if err != nil {
 		return fmt.Errorf("create cmc_data table: %w", err)
 	}
-	_, err = tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS accountabstraction (address type_address PRIMARY KEY, nonce BIGINT, init_code TEXT, validation_data TEXT, paymaster_and_data TEXT, signature TEXT, block_number BIGINT REFERENCES blocks(block_number), retrieved_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, retrieved_from VARCHAR);`)
+	_, err = tx.Exec(ctx, `
+    CREATE TABLE IF NOT EXISTS aa_transactions (
+			aa_txn_hash BYTEA PRIMARY KEY,
+			bundle_txn_hash BYTEA NOT NULL REFERENCES transactions(tx_hash) ON DELETE CASCADE,
+			from_address type_address NOT NULL,
+			method VARCHAR(10)
+		);
+	`)
 	if err != nil {
-		return fmt.Errorf("create accountabstraction table: %w", err)
+		return fmt.Errorf("create aa_transactions table: %w", err)
 	}
 	_, err = tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS tokenbalances (address type_address NOT NULL REFERENCES accounts(address), token_address type_address NOT NULL REFERENCES tokens(contract_address), balance NUMERIC(38, 0) NOT NULL, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (address, token_address));`)
 	if err != nil {
@@ -236,6 +243,23 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
 	`)
 	if err != nil {
 		return fmt.Errorf("create beacon_deposits table: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `
+	CREATE TABLE IF NOT EXISTS pending_tx_stats (
+		id SERIAL PRIMARY KEY,
+		timestamp TIMESTAMPTZ NOT NULL,
+		tx_count INT NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_pending_tx_stats_timestamp ON pending_tx_stats (timestamp);
+	`)
+	if err != nil {
+		return fmt.Errorf("create pending_tx_stats table: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS gas_used BIGINT;`)
+	if err != nil {
+		return fmt.Errorf("alter transactions table to add gas_used: %w", err)
 	}
 
 	_, err = tx.Exec(ctx, `

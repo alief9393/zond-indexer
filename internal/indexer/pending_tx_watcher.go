@@ -58,6 +58,12 @@ func (i *Indexer) StartPendingTxWatcher(ctx context.Context) {
 				continue
 			}
 
+			if err := db.InsertPendingTxStat(ctx, tx, len(pendingTxs)); err != nil {
+				log.Printf("❌ [Watcher] Failed to save pending transaction stats: %v", err)
+				tx.Rollback(ctx)
+				continue
+			}
+
 			if len(pendingTxs) > 0 {
 				log.Printf("✅ [Watcher] Found %d pending transactions. Saving to DB...", len(pendingTxs))
 				// Also pass the transaction object `tx` here.

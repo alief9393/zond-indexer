@@ -5,7 +5,7 @@ go 1.24.0
 require (
 	github.com/jackc/pgx/v5 v5.7.4
 	github.com/joho/godotenv v1.5.1
-	github.com/theQRL/go-zond v0.2.1
+	github.com/theQRL/go-zond v0.2.2
 )
 
 require (

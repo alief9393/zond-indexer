@@ -22,6 +22,7 @@ type Transaction struct {
 	MaxFeePerGas         *string   `db:"max_fee_per_gas"`
 	MaxPriorityFeePerGas *string   `db:"max_priority_fee_per_gas"`
 	TransactionIndex     int       `db:"transaction_index"`
+	GasUsed              int64     `db:"gas_used"`
 	CumulativeGasUsed    int64     `db:"cumulative_gas_used"`
 	IsSuccessful         bool      `db:"is_successful"`
 	RetrievedFrom        string    `db:"retrieved_from"`

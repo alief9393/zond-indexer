@@ -377,14 +377,14 @@ func insertTransactions(
 		_, err = tx.Exec(ctx,
 			`INSERT INTO Transactions (
                 tx_hash, block_number, from_address, to_address, value, gas,
-                gas_price, type, chain_id, access_list, max_fee_per_gas,
+                gas_price, gas_used, type, chain_id, access_list, max_fee_per_gas,
                 max_priority_fee_per_gas, transaction_index, cumulative_gas_used,
                 is_successful, retrieved_from, is_canonical, timestamp, is_contract, method
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
             ON CONFLICT (tx_hash) DO UPDATE
             SET block_number = EXCLUDED.block_number, from_address = EXCLUDED.from_address,
                 to_address = EXCLUDED.to_address, value = EXCLUDED.value, gas = EXCLUDED.gas,
-                gas_price = EXCLUDED.gas_price, type = EXCLUDED.type, chain_id = EXCLUDED.chain_id,
+                gas_price = EXCLUDED.gas_price, gas_used = EXCLUDED.gas_used, type = EXCLUDED.type, chain_id = EXCLUDED.chain_id,
                 access_list = EXCLUDED.access_list, max_fee_per_gas = EXCLUDED.max_fee_per_gas,
                 max_priority_fee_per_gas = EXCLUDED.max_priority_fee_per_gas,
                 transaction_index = EXCLUDED.transaction_index, cumulative_gas_used = EXCLUDED.cumulative_gas_used,
@@ -397,6 +397,7 @@ func insertTransactions(
 			transaction.Value().String(),
 			int64(transaction.Gas()),
 			transaction.GasPrice().String(),
+			int64(receipt.GasUsed),
 			int(transaction.Type()),
 			transaction.ChainId().Int64(),
 			accessList,

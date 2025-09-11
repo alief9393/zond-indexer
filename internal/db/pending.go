@@ -64,3 +64,9 @@ func DeletePendingTransactionByHash(ctx context.Context, tx pgx.Tx, txHash []byt
 	_, err := tx.Exec(ctx, `DELETE FROM pending_transactions WHERE tx_hash = $1`, txHash)
 	return err
 }
+
+func InsertPendingTxStat(ctx context.Context, tx pgx.Tx, count int) error {
+	query := `INSERT INTO pending_tx_stats (timestamp, tx_count) VALUES (NOW(), $1)`
+	_, err := tx.Exec(ctx, query, count)
+	return err
+}
