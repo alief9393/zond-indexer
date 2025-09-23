@@ -74,7 +74,7 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
             chain_id BIGINT NOT NULL, access_list JSONB NOT NULL, max_fee_per_gas TEXT, max_priority_fee_per_gas TEXT,
             transaction_index INTEGER NOT NULL, cumulative_gas_used BIGINT NOT NULL, is_successful BOOLEAN NOT NULL,
             retrieved_from VARCHAR NOT NULL, is_canonical BOOLEAN NOT NULL DEFAULT TRUE, timestamp TIMESTAMPTZ,
-            is_pending BOOLEAN DEFAULT FALSE, fee_eth NUMERIC, fee_usd NUMERIC, is_contract BOOLEAN, method VARCHAR(10)
+            is_pending BOOLEAN DEFAULT FALSE, fee_eth NUMERIC, fee_usd NUMERIC, is_contract BOOLEAN, method VARCHAR(100) -- <-- CHANGED FROM 10 to 100
         );
     `)
 	if err != nil {
@@ -129,7 +129,19 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
 	if err != nil {
 		return fmt.Errorf("create tokens table: %w", err)
 	}
-	_, err = tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS tokentransactions (tx_hash BYTEA NOT NULL REFERENCES transactions(tx_hash), contract_address type_address NOT NULL REFERENCES tokens(contract_address), from_address type_address NOT NULL REFERENCES accounts(address), to_address type_address NOT NULL REFERENCES accounts(address), token_id VARCHAR(255), value BIGINT CHECK (value >= 0) NOT NULL, PRIMARY KEY (tx_hash, contract_address, from_address, to_address, token_id), is_canonical BOOLEAN DEFAULT TRUE, retrieved_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, retrieved_from VARCHAR, reverted_at TIMESTAMP WITH TIME ZONE);`)
+	_, err = tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS tokentransactions (
+        tx_hash BYTEA NOT NULL REFERENCES transactions(tx_hash),
+        contract_address type_address NOT NULL REFERENCES tokens(contract_address),
+        from_address type_address NOT NULL REFERENCES accounts(address),
+        to_address type_address NOT NULL REFERENCES accounts(address),
+        token_id VARCHAR(255),
+        value TEXT NOT NULL,
+        PRIMARY KEY (tx_hash, log_index),
+        is_canonical BOOLEAN DEFAULT TRUE,
+        retrieved_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        retrieved_from VARCHAR,
+        reverted_at TIMESTAMP WITH TIME ZONE
+    );`)
 	if err != nil {
 		return fmt.Errorf("create tokentransactions table: %w", err)
 	}
