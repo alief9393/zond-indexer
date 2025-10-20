@@ -3,7 +3,9 @@ package indexer
 import (
 	"context"
 	"fmt"
+	"log"
 	"math/big"
+	"strconv"
 	"time"
 
 	"zond-indexer/internal/config"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sirupsen/logrus"
+	"github.com/streadway/amqp"
 	"github.com/theQRL/go-zond/core/types"
 	"github.com/theQRL/go-zond/rpc"
 	"github.com/theQRL/go-zond/zondclient"
@@ -35,6 +38,8 @@ type Indexer struct {
 		blockHash   []byte
 	}
 	validatorIndexer *ValidatorIndexer
+	amqpChannel      *amqp.Channel
+	amqpConn         *amqp.Connection
 }
 
 func NewIndexer(config config.Config) (*Indexer, error) {
@@ -70,6 +75,26 @@ func NewIndexer(config config.Config) (*Indexer, error) {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
+	log.Println("🐇 Connecting to RabbitMQ...")
+	amqpConn, err := amqp.Dial(config.RABBITMQ_URL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to RabbitMQ: %w", err)
+	}
+
+	amqpChannel, err := amqpConn.Channel()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open RabbitMQ channel: %w", err)
+	}
+
+	_, err = amqpChannel.QueueDeclare(
+		"zond_blocks_queue",
+		true, false, false, false, nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to declare RabbitMQ queue: %w", err)
+	}
+	log.Println(" RabbitMQ channel and queue are ready.")
+
 	var lastIndexedBlock int64
 	err = db.QueryRow(context.Background(), "SELECT COALESCE(MAX(block_number), -1) FROM blocks").Scan(&lastIndexedBlock)
 	if err != nil {
@@ -81,7 +106,6 @@ func NewIndexer(config config.Config) (*Indexer, error) {
 
 	log.Infof("✅ Indexer successfully initialized. Starting from block #%d", start)
 
-	// ✅ Initialize ValidatorIndexer
 	validatorIndexer := &ValidatorIndexer{
 		Client:               client,
 		DB:                   db,
@@ -101,13 +125,19 @@ func NewIndexer(config config.Config) (*Indexer, error) {
 		historical:         start,
 		lastValidatorIndex: 0,
 		epochLength:        32,
-		validatorIndexer:   validatorIndexer, // ✅ attach it
+		validatorIndexer:   validatorIndexer,
 	}, nil
 }
 
 func (i *Indexer) Close() {
 	i.db.Close()
 	i.rpcClient.Close()
+	if i.amqpChannel != nil {
+		i.amqpChannel.Close()
+	}
+	if i.amqpConn != nil {
+		i.amqpConn.Close()
+	}
 }
 
 func (i *Indexer) Config() config.Config {
@@ -128,6 +158,56 @@ func (i *Indexer) DB() *pgxpool.Pool {
 
 func (i *Indexer) ChainID() *big.Int {
 	return i.chainID
+}
+
+func (i *Indexer) RunConsumer(ctx context.Context) error {
+	msgs, err := i.amqpChannel.Consume(
+		"zond_blocks_queue",
+		"", false, false, false, false, nil,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to register a consumer: %w", err)
+	}
+
+	log.Println(" [*] Consumer is waiting for block messages. To exit press CTRL+C")
+
+	done := make(chan bool)
+
+	go func() {
+		for d := range msgs {
+			blockNumberStr := string(d.Body)
+			blockNumber, err := strconv.ParseUint(blockNumberStr, 10, 64)
+			if err != nil {
+				log.Printf("Invalid block number received: %s. Rejecting.", blockNumberStr)
+				d.Nack(false, false)
+				continue
+			}
+
+			log.Printf("📬 Received block #%d. Processing...", blockNumber)
+
+			err = indexBlock(ctx, i.config, i.client, i.rpcClient, i.db, blockNumber, i.chainID, true)
+			if err != nil {
+				log.Printf(" Failed to index block #%d: %v. Re-queuing.", blockNumber, err)
+				d.Nack(false, true)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
+			d.Ack(false)
+			log.Printf(" Successfully indexed block #%d.", blockNumber)
+		}
+		done <- true
+	}()
+
+	<-ctx.Done()
+	log.Println("Consumer shutting down. Closing RabbitMQ channel...")
+	if err := i.amqpChannel.Close(); err != nil {
+		log.Printf("Error closing AMQP channel: %v", err)
+	}
+	<-done
+	log.Println("AMQP channel closed.")
+
+	return nil
 }
 
 func (i *Indexer) Run(ctx context.Context) error {

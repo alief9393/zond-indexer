@@ -8,6 +8,8 @@ require (
 	github.com/theQRL/go-zond v0.2.2
 )
 
+require github.com/streadway/amqp v1.1.0 // indirect
+
 require (
 	github.com/DataDog/zstd v1.5.2 // indirect
 	github.com/klauspost/compress v1.16.4 // indirect

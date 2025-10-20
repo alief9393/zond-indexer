@@ -14,6 +14,7 @@ type Config struct {
 	BeaconHost      string
 	BeaconPort      int
 	RPCEndpointHttp string
+	RABBITMQ_URL    string `env:"RABBITMQ_URL,required"`
 }
 
 // LoadConfig loads the configuration from environment variables
@@ -23,6 +24,7 @@ func LoadConfig() (Config, error) {
 		PostgresConn:    getEnv("POSTGRES_CONN", ""),
 		BeaconHost:      getEnv("BEACON_HOST", "localhost"),
 		RPCEndpointHttp: getEnv("RPC_ENDPOINT", ""),
+		RABBITMQ_URL:    os.Getenv("RABBITMQ_URL"),
 	}
 
 	// Parse the beacon port
