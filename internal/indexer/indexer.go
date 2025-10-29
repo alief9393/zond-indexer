@@ -45,20 +45,20 @@ type Indexer struct {
 func NewIndexer(config config.Config) (*Indexer, error) {
 	log := logger.Logger
 
-	log.Infof("🔌 Connecting to WS endpoint: %s", config.WSEndpoint)
+	log.Infof("Connecting to WS endpoint: %s", config.WSEndpoint)
 	rpcClient, err := rpc.Dial(config.WSEndpoint)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to WS endpoint: %w", err)
 	}
 	client := zondclient.NewClient(rpcClient)
 
-	log.Info("🔑 Fetching chain ID")
+	log.Info("Fetching chain ID")
 	chainID, err := client.ChainID(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch chain ID: %w", err)
 	}
 
-	log.Info("🗄️  Connecting to database")
+	log.Info("Connecting to database")
 	dbConfig, err := pgxpool.ParseConfig(config.PostgresConn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse Postgres connection string: %w", err)
@@ -68,14 +68,14 @@ func NewIndexer(config config.Config) (*Indexer, error) {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
-	log.Info("🔍 Pinging database")
+	log.Info("Pinging database")
 	err = db.Ping(context.Background())
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	log.Println("🐇 Connecting to RabbitMQ...")
+	log.Println("Connecting to RabbitMQ...")
 	amqpConn, err := amqp.Dial(config.RABBITMQ_URL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to RabbitMQ: %w", err)
@@ -126,6 +126,8 @@ func NewIndexer(config config.Config) (*Indexer, error) {
 		lastValidatorIndex: 0,
 		epochLength:        32,
 		validatorIndexer:   validatorIndexer,
+		amqpChannel:        amqpChannel,
+		amqpConn:           amqpConn,
 	}, nil
 }
 
