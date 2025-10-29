@@ -171,11 +171,16 @@ func (i *Indexer) RunConsumer(ctx context.Context) error {
 		return fmt.Errorf("failed to register a consumer: %w", err)
 	}
 
-	log.Println(" [*] Consumer is waiting for block messages. To exit press CTRL+C")
+	log.Println(" Consumer is waiting for block messages. To exit press CTRL+C")
 
-	done := make(chan bool)
+	done := make(chan struct{})
 
 	go func() {
+		defer func() {
+			log.Println("AMQP message loop exited.")
+			close(done)
+		}()
+
 		for d := range msgs {
 			blockNumberStr := string(d.Body)
 			blockNumber, err := strconv.ParseUint(blockNumberStr, 10, 64)
@@ -198,57 +203,57 @@ func (i *Indexer) RunConsumer(ctx context.Context) error {
 			d.Ack(false)
 			log.Printf(" Successfully indexed block #%d.", blockNumber)
 		}
-		done <- true
 	}()
 
-	<-ctx.Done()
-	log.Println("Consumer shutting down. Closing RabbitMQ channel...")
-	if err := i.amqpChannel.Close(); err != nil {
-		log.Printf("Error closing AMQP channel: %v", err)
-	}
-	<-done
-	log.Println("AMQP channel closed.")
+	select {
+	case <-ctx.Done():
+		log.Println("Consumer shutting down (signal received)...")
+		<-done
+		log.Println("AMQP processing finished.")
+		return nil
 
-	return nil
+	case <-done:
+		return fmt.Errorf("amqp consumer channel closed unexpectedly (connection lost?)")
+	}
 }
 
 func (i *Indexer) Run(ctx context.Context) error {
 	syncing, err := i.client.SyncProgress(ctx)
 	if err != nil {
-		return fmt.Errorf("❌ failed to check sync progress: %w", err)
+		return fmt.Errorf(" failed to check sync progress: %w", err)
 	}
 	if syncing != nil {
 		return fmt.Errorf("🚧 node is not fully synced: current=%d highest=%d", syncing.CurrentBlock, syncing.HighestBlock)
 	}
-	logger.Logger.Info("✅ Node is fully synced")
+	logger.Logger.Info(" Node is fully synced")
 	go i.StartPendingTxWatcher(ctx)
 	var lastIndexedBlock int64
 	err = i.db.QueryRow(ctx, `SELECT COALESCE(MAX(block_number), -1) FROM Blocks WHERE canonical = TRUE`).Scan(&lastIndexedBlock)
 	if err != nil {
-		return fmt.Errorf("❌ failed to fetch last indexed block: %w", err)
+		return fmt.Errorf(" failed to fetch last indexed block: %w", err)
 	}
 	startBlock := uint64(lastIndexedBlock + 1)
 
 	latestBlock, err := i.client.BlockNumber(ctx)
 	if err != nil {
-		return fmt.Errorf("❌ failed to get latest block number from node: %w", err)
+		return fmt.Errorf(" failed to get latest block number from node: %w", err)
 	}
 	i.historical = latestBlock
 
-	logger.Logger.Infof("📦 Resuming block indexing from #%d up to cap #%d", startBlock, i.historical)
+	logger.Logger.Infof(" Resuming block indexing from #%d up to cap #%d", startBlock, i.historical)
 
 	for blockNum := startBlock; blockNum <= i.historical; blockNum++ {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			logger.Logger.Infof("⛏️  Indexing historical block #%d", blockNum)
+			logger.Logger.Infof("  Indexing historical block #%d", blockNum)
 
 			if err := i.validatorIndexer.IndexPeriodically(ctx, blockNum); err != nil {
 				logger.Logger.WithFields(logrus.Fields{
 					"block": blockNum,
 					"err":   err,
-				}).Warn("⚠️  Validator indexing failed")
+				}).Warn("  Validator indexing failed")
 				continue
 			}
 
@@ -256,7 +261,7 @@ func (i *Indexer) Run(ctx context.Context) error {
 				logger.Logger.WithFields(logrus.Fields{
 					"block": blockNum,
 					"err":   err,
-				}).Error("❌ Failed to index block")
+				}).Error(" Failed to index block")
 				continue
 			}
 
@@ -265,7 +270,7 @@ func (i *Indexer) Run(ctx context.Context) error {
 				logger.Logger.WithFields(logrus.Fields{
 					"block": blockNum,
 					"err":   err,
-				}).Error("❌ Failed to fetch block for head tracking")
+				}).Error(" Failed to fetch block for head tracking")
 				continue
 			}
 
@@ -275,12 +280,12 @@ func (i *Indexer) Run(ctx context.Context) error {
 		}
 	}
 
-	logger.Logger.Info("🔁 Switching to real-time block indexing")
+	logger.Logger.Info(" Switching to real-time block indexing")
 
 	headers := make(chan *types.Header)
 	sub, err := i.client.SubscribeNewHead(ctx, headers)
 	if err != nil {
-		return fmt.Errorf("❌ failed to subscribe to new headers: %w", err)
+		return fmt.Errorf(" failed to subscribe to new headers: %w", err)
 	}
 	defer sub.Unsubscribe()
 
@@ -296,23 +301,23 @@ func (i *Indexer) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case err := <-sub.Err():
-			return fmt.Errorf("📡 subscription error: %w", err)
+			return fmt.Errorf(" subscription error: %w", err)
 		case header := <-headers:
 			blockNum := header.Number.Uint64()
-			logger.Logger.Infof("🆕 New block received: #%d", blockNum)
+			logger.Logger.Infof(" New block received: #%d", blockNum)
 
 			block, err := i.client.BlockByNumber(ctx, big.NewInt(int64(blockNum)))
 			if err != nil {
-				logger.Logger.WithField("block", blockNum).WithError(err).Error("❌ Failed to fetch block")
+				logger.Logger.WithField("block", blockNum).WithError(err).Error(" Failed to fetch block")
 				continue
 			}
 
 			parentHash := block.ParentHash().Bytes()
 			if i.lastHead.blockNumber > 0 && i.lastHead.blockNumber == int64(blockNum)-1 {
 				if !utils.BytesEqual(parentHash, i.lastHead.blockHash) {
-					logger.Logger.Warnf("🔄 Reorg detected at block #%d", blockNum)
+					logger.Logger.Warnf(" Reorg detected at block #%d", blockNum)
 					if err := i.handleReorg(ctx, block); err != nil {
-						logger.Logger.WithField("block", blockNum).WithError(err).Error("❌ Failed to handle reorg")
+						logger.Logger.WithField("block", blockNum).WithError(err).Error(" Failed to handle reorg")
 						continue
 					}
 				}
@@ -330,7 +335,7 @@ func (i *Indexer) Run(ctx context.Context) error {
 				logger.Logger.WithFields(logrus.Fields{
 					"block": blockNum,
 					"err":   err,
-				}).Error("❌ Failed to index block")
+				}).Error(" Failed to index block")
 				continue
 			}
 

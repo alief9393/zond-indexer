@@ -56,6 +56,9 @@ func LoadConfig() (Config, error) {
 	if cfg.BeaconPort <= 0 || cfg.BeaconPort > 65535 {
 		return Config{}, fmt.Errorf("BEACON_PORT must be between 1 and 65535, got %d", cfg.BeaconPort)
 	}
+	if cfg.RABBITMQ_URL == "" {
+		return Config{}, fmt.Errorf("RABBITMQ_URL is required")
+	}
 
 	return cfg, nil
 }

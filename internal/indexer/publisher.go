@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"fmt"
 	"log"
 
 	"zond-indexer/internal/config"
@@ -63,7 +64,7 @@ func StartPublisher(ctx context.Context, cfg config.Config) error {
 				Body:        []byte(blockNumber),
 			})
 			if err != nil {
-				log.Printf("Failed to publish block #%s: %v", blockNumber, err)
+				return fmt.Errorf("failed to publish block #%s: %w", blockNumber, err)
 			}
 		}
 	}
