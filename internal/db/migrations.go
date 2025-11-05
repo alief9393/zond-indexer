@@ -296,5 +296,18 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
 		return fmt.Errorf("commit transaction: %w", err)
 	}
 
+	_, err = tx.Exec(ctx, `
+    CREATE TABLE IF NOT EXISTS address_daily_balances (
+            address type_address NOT NULL REFERENCES accounts(address) ON DELETE CASCADE,
+            date DATE NOT NULL,
+            balance_planck TEXT NOT NULL,
+            balance_usd NUMERIC(30, 10) NOT NULL,
+            PRIMARY KEY (address, date)
+        );
+    `)
+    if err != nil {
+        return fmt.Errorf("create address_daily_balances table: %w", err)
+    }
+
 	return nil
 }

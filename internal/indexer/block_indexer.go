@@ -513,6 +513,12 @@ func insertAccounts(
 	accountsToUpdate map[string]accountUpdateData,
 	timestamp time.Time,
 ) error {
+	var qrlPrice float64
+	err := tx.QueryRow(ctx, `SELECT price_usd FROM cmc_data WHERE symbol = 'QRL' ORDER BY retrieved_at DESC LIMIT 1`).Scan(&qrlPrice)
+	if err != nil && err != pgx.ErrNoRows {
+		return fmt.Errorf("fetch qrl price: %w", err)
+	}
+
 	for address, data := range accountsToUpdate {
 		addr, err := utils.HexToAddress(address)
 		if err != nil {
@@ -537,7 +543,6 @@ func insertAccounts(
 			return fmt.Errorf("fetch code for %s: %w", address, err)
 		}
 
-		// Check if the account exists to determine if it's the first time we've seen it.
 		var exists bool
 		err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM Accounts WHERE address = $1)`, addrBytes).Scan(&exists)
 		if err != nil {
@@ -548,7 +553,6 @@ func insertAccounts(
 		nonceInt := int(nonce)
 
 		if !exists {
-			// This is a brand new account.
 			funderAddress := []byte(nil)
 			fundingTxHash := []byte(nil)
 			firstTxSentTimestamp := (*time.Time)(nil)
@@ -563,9 +567,9 @@ func insertAccounts(
 
 			_, err = tx.Exec(ctx,
 				`INSERT INTO Accounts (
-					address, balance, nonce, is_contract, code, first_seen, last_seen, retrieved_from,
-					funder_address, funding_tx_hash, first_tx_sent_timestamp, last_tx_sent_timestamp
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+                    address, balance, nonce, is_contract, code, first_seen, last_seen, retrieved_from,
+                    funder_address, funding_tx_hash, first_tx_sent_timestamp, last_tx_sent_timestamp
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 				addrBytes,
 				balanceStr,
 				nonceInt,
@@ -577,38 +581,58 @@ func insertAccounts(
 				funderAddress,
 				fundingTxHash,
 				firstTxSentTimestamp,
-				&timestamp, // last_tx_sent is always now
+				&timestamp,
 			)
 			if err != nil {
 				return fmt.Errorf("insert new account %s: %w", address, err)
 			}
 		} else {
-			// The account already exists, so we update it.
-			// We only update first_tx_sent_timestamp if it's NULL and this is a send operation.
 			var updateQuery string
 			if data.isSender {
 				updateQuery = `
-					UPDATE Accounts SET
-						balance = $1,
-						nonce = $2,
-						last_seen = $3,
-						last_tx_sent_timestamp = $3,
-						first_tx_sent_timestamp = COALESCE(first_tx_sent_timestamp, $3)
-					WHERE address = $4`
+                    UPDATE Accounts SET
+                        balance = $1,
+                        nonce = $2,
+                        last_seen = $3,
+                        last_tx_sent_timestamp = $3,
+                        first_tx_sent_timestamp = COALESCE(first_tx_sent_timestamp, $3)
+                    WHERE address = $4`
 			} else {
-				// If it's just a receiver, we only update balance and last_seen.
 				updateQuery = `
-					UPDATE Accounts SET
-						balance = $1,
-						nonce = $2,
-						last_seen = $3
-					WHERE address = $4`
+                    UPDATE Accounts SET
+                        balance = $1,
+                        nonce = $2,
+                        last_seen = $3
+                    WHERE address = $4`
 			}
 
 			_, err = tx.Exec(ctx, updateQuery, balanceStr, nonceInt, timestamp, addrBytes)
 			if err != nil {
 				return fmt.Errorf("update existing account %s: %w", address, err)
 			}
+		}
+
+		var balanceUsd float64
+		if qrlPrice > 0 {
+			balanceBigInt, _ := new(big.Int).SetString(balanceStr, 10)
+			if balanceBigInt != nil {
+				balanceFloat := new(big.Float).SetInt(balanceBigInt)
+				divisor := new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
+				realBalance := new(big.Float).Quo(balanceFloat, divisor)
+				value := new(big.Float).Mul(realBalance, big.NewFloat(qrlPrice))
+				balanceUsd, _ = value.Float64()
+			}
+		}
+
+		_, err = tx.Exec(ctx, `
+            INSERT INTO address_daily_balances (address, date, balance_planck, balance_usd)
+            VALUES ($1, $2::date, $3, $4)
+            ON CONFLICT (address, date) DO UPDATE SET
+                balance_planck = EXCLUDED.balance_planck,
+                balance_usd = EXCLUDED.balance_usd
+        `, addrBytes, timestamp, balanceStr, balanceUsd)
+		if err != nil {
+			return fmt.Errorf("upsert daily balance for %s: %w", address, err)
 		}
 	}
 	return nil
