@@ -1,0 +1,141 @@
+package indexer
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// This is the SQL query you need to run. It calculates all the stats for a single day.
+const dailyNetworkStatsQuery = `
+INSERT INTO daily_network_stats (
+    date,
+    total_transactions,
+    avg_block_time_sec,
+    avg_block_size_bytes,
+    total_block_count,
+    new_addresses
+    -- avg_difficulty,
+    -- hash_rate
+)
+SELECT
+    b.day,
+    COALESCE(SUM(b.transaction_count), 0) AS total_transactions,
+    CASE 
+        WHEN COALESCE(COUNT(b.block_number), 0) > 0 THEN 86400.0 / COALESCE(COUNT(b.block_number), 0)
+        ELSE 0 
+    END AS avg_block_time_sec,
+    COALESCE(AVG(b.size), 0) AS avg_block_size_bytes,
+    COALESCE(COUNT(b.block_number), 0) AS total_block_count,
+    COALESCE(a.new_addresses, 0) AS new_addresses
+    -- COALESCE(AVG(b.difficulty), 0) AS avg_difficulty, -- Uncomment when you index difficulty
+    -- COALESCE(AVG(b.hash_rate), 0) AS hash_rate         -- Uncomment when you index hash_rate
+FROM (
+    SELECT
+        timestamp::date AS day,
+        transaction_count,
+        block_number,
+        size
+        -- difficulty,
+        -- hash_rate
+    FROM blocks
+    WHERE timestamp::date = $1::date
+) b
+LEFT JOIN (
+    SELECT
+        first_seen::date AS day,
+        COUNT(*) AS new_addresses
+    FROM accounts
+    WHERE first_seen::date = $1::date
+    GROUP BY day
+) a ON b.day = a.day
+GROUP BY b.day, a.new_addresses
+ON CONFLICT (date) DO UPDATE SET
+    total_transactions = EXCLUDED.total_transactions,
+    avg_block_time_sec = EXCLUDED.avg_block_time_sec,
+    avg_block_size_bytes = EXCLUDED.avg_block_size_bytes,
+    total_block_count = EXCLUDED.total_block_count,
+    new_addresses = EXCLUDED.new_addresses;
+    -- avg_difficulty = EXCLUDED.avg_difficulty,
+    -- hash_rate = EXCLUDED.hash_rate;
+`
+
+// runStatsForDay executes the aggregation query for the given day.
+func runStatsForDay(ctx context.Context, db *pgxpool.Pool, day time.Time) error {
+	dateStr := day.Format("2006-01-02")
+	log.Printf("[StatsJob] Running stats query for %s...", dateStr)
+	
+	_, err := db.Exec(ctx, dailyNetworkStatsQuery, dateStr)
+	if err != nil {
+		return fmt.Errorf("failed to execute daily stats query for %s: %w", dateStr, err)
+	}
+	
+	log.Printf("[StatsJob] Successfully saved stats for %s.", dateStr)
+	return nil
+}
+
+// backfillDailyStats checks for any missing days between the last run and yesterday.
+func backfillDailyStats(ctx context.Context, db *pgxpool.Pool) {
+	var lastIndexedDate time.Time
+	
+	// Find the last date we have stats for.
+	err := db.QueryRow(ctx, "SELECT COALESCE(MAX(date), '1970-01-01'::date) FROM daily_network_stats").Scan(&lastIndexedDate)
+	if err != nil {
+		log.Printf("[StatsJob] Error getting last indexed date: %v", err)
+		return
+	}
+
+	// We only backfill up to yesterday. Today's stats run at midnight.
+	yesterday := time.Now().Truncate(24 * time.Hour).Add(-1 * time.Second)
+
+	// Loop from the day after the last indexed day up to yesterday.
+	for day := lastIndexedDate.AddDate(0, 0, 1); day.Before(yesterday); day = day.AddDate(0, 0, 1) {
+		select {
+		case <-ctx.Done():
+			log.Printf("[StatsJob] Backfill shutting down.")
+			return
+		default:
+			if err := runStatsForDay(ctx, db, day); err != nil {
+				log.Printf("[StatsJob] Error backfilling stats for %s: %v", day.Format("2006-01-02"), err)
+				// Don't stop, just try the next day.
+			}
+		}
+	}
+	log.Println("[StatsJob] Backfill complete.")
+}
+
+// RunDailyStatsScheduler runs a job to populate the daily_network_stats table.
+// It backfills any missing days on startup and then runs once daily at midnight.
+func RunDailyStatsScheduler(ctx context.Context, db *pgxpool.Pool) {
+	log.Println("[StatsJob] Starting daily stats scheduler...")
+
+	// 1. Run backfill on startup to catch any missed days.
+	go backfillDailyStats(ctx, db)
+
+	// 2. Loop and run the job at midnight every day.
+	for {
+		// Calculate duration until next midnight (in local time)
+		now := time.Now()
+		midnight := now.Truncate(24 * time.Hour).Add(24 * time.Hour)
+		durationUntilMidnight := time.Until(midnight)
+
+		log.Printf("[StatsJob] Next run scheduled for %v (in %v)", midnight, durationUntilMidnight)
+		
+		select {
+		case <-ctx.Done():
+			// Context was cancelled, shut down the scheduler.
+			log.Println("[StatsJob] Scheduler shutting down.")
+			return
+		
+		case <-time.After(durationUntilMidnight):
+			// It's midnight. Run the stats for "yesterday".
+			yesterday := time.Now().Add(-1 * time.Minute) // 1 minute ago to be safe
+			if err := runStatsForDay(ctx, db, yesterday); err != nil {
+				log.Printf("[StatsJob] Failed to run daily stats job: %v", err)
+			}
+		}
+	}
+}

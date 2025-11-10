@@ -292,9 +292,6 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
 		return fmt.Errorf("create token_market_data table: %w", err)
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit transaction: %w", err)
-	}
 
 	_, err = tx.Exec(ctx, `
     CREATE TABLE IF NOT EXISTS address_daily_balances (
@@ -308,6 +305,30 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
     if err != nil {
         return fmt.Errorf("create address_daily_balances table: %w", err)
     }
+
+	_, err = tx.Exec(ctx, `
+    CREATE TABLE IF NOT EXISTS daily_network_stats (
+            date DATE PRIMARY KEY,
+            total_transactions BIGINT NOT NULL,
+            avg_difficulty NUMERIC,
+            hash_rate NUMERIC,
+            avg_block_time_sec FLOAT NOT NULL,
+            avg_block_size_bytes FLOAT NOT NULL,
+            total_block_count INT NOT NULL,
+            new_addresses INT NOT NULL
+        );
+    `)
+    if err != nil {
+        return fmt.Errorf("create daily_network_stats table: %w", err)
+    }
+    _, err = tx.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_daily_network_stats_date ON daily_network_stats (date);`)
+    if err != nil {
+        return fmt.Errorf("create daily_network_stats index: %w", err)
+    }
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
 
 	return nil
 }

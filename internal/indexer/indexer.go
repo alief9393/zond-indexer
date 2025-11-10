@@ -40,6 +40,7 @@ type Indexer struct {
 	validatorIndexer *ValidatorIndexer
 	amqpChannel      *amqp.Channel
 	amqpConn         *amqp.Connection
+	isStatsJobStarted  bool
 }
 
 func NewIndexer(config config.Config) (*Indexer, error) {
@@ -163,6 +164,7 @@ func (i *Indexer) ChainID() *big.Int {
 }
 
 func (i *Indexer) RunConsumer(ctx context.Context) error {
+	go i.StartDailyStatsJob(ctx)
 	msgs, err := i.amqpChannel.Consume(
 		"zond_blocks_queue",
 		"", false, false, false, false, nil,
@@ -217,6 +219,15 @@ func (i *Indexer) RunConsumer(ctx context.Context) error {
 	}
 }
 
+func (i *Indexer) StartDailyStatsJob(ctx context.Context) {
+    if i.isStatsJobStarted {
+        return
+    }
+    i.isStatsJobStarted = true
+    
+    go RunDailyStatsScheduler(ctx, i.db)
+}
+
 func (i *Indexer) Run(ctx context.Context) error {
 	syncing, err := i.client.SyncProgress(ctx)
 	if err != nil {
@@ -226,6 +237,7 @@ func (i *Indexer) Run(ctx context.Context) error {
 		return fmt.Errorf("🚧 node is not fully synced: current=%d highest=%d", syncing.CurrentBlock, syncing.HighestBlock)
 	}
 	logger.Logger.Info(" Node is fully synced")
+	go i.StartDailyStatsJob(ctx)
 	go i.StartPendingTxWatcher(ctx)
 	var lastIndexedBlock int64
 	err = i.db.QueryRow(ctx, `SELECT COALESCE(MAX(block_number), -1) FROM Blocks WHERE canonical = TRUE`).Scan(&lastIndexedBlock)
