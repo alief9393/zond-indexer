@@ -11,13 +11,24 @@ import (
 
 // This is the SQL query you need to run. It calculates all the stats for a single day.
 const dailyNetworkStatsQuery = `
+WITH daily_token_txs AS (
+    SELECT
+        tx.timestamp::date AS day,
+        COUNT(tt.tx_hash) AS count
+    FROM tokentransactions tt
+    JOIN transactions tx ON tt.tx_hash = tx.tx_hash
+    WHERE tt.token_id IS NULL -- ERC-20 only
+      AND tx.timestamp::date = $1::date
+    GROUP BY tx.timestamp::date
+)
 INSERT INTO daily_network_stats (
     date,
     total_transactions,
     avg_block_time_sec,
     avg_block_size_bytes,
     total_block_count,
-    new_addresses
+    new_addresses,
+    total_token_transfers
     -- avg_difficulty,
     -- hash_rate
 )
@@ -30,9 +41,10 @@ SELECT
     END AS avg_block_time_sec,
     COALESCE(AVG(b.size), 0) AS avg_block_size_bytes,
     COALESCE(COUNT(b.block_number), 0) AS total_block_count,
-    COALESCE(a.new_addresses, 0) AS new_addresses
-    -- COALESCE(AVG(b.difficulty), 0) AS avg_difficulty, -- Uncomment when you index difficulty
-    -- COALESCE(AVG(b.hash_rate), 0) AS hash_rate         -- Uncomment when you index hash_rate
+    COALESCE(a.new_addresses, 0) AS new_addresses,
+    COALESCE(dtt.count, 0) AS total_token_transfers
+    -- COALESCE(AVG(b.difficulty), 0) AS avg_difficulty,
+    -- COALESCE(AVG(b.hash_rate), 0) AS hash_rate
 FROM (
     SELECT
         timestamp::date AS day,
@@ -52,13 +64,15 @@ LEFT JOIN (
     WHERE first_seen::date = $1::date
     GROUP BY day
 ) a ON b.day = a.day
-GROUP BY b.day, a.new_addresses
+LEFT JOIN daily_token_txs dtt ON b.day = dtt.day
+GROUP BY b.day, a.new_addresses, dtt.count
 ON CONFLICT (date) DO UPDATE SET
     total_transactions = EXCLUDED.total_transactions,
     avg_block_time_sec = EXCLUDED.avg_block_time_sec,
     avg_block_size_bytes = EXCLUDED.avg_block_size_bytes,
     total_block_count = EXCLUDED.total_block_count,
-    new_addresses = EXCLUDED.new_addresses;
+    new_addresses = EXCLUDED.new_addresses,
+    total_token_transfers = EXCLUDED.total_token_transfers;
     -- avg_difficulty = EXCLUDED.avg_difficulty,
     -- hash_rate = EXCLUDED.hash_rate;
 `

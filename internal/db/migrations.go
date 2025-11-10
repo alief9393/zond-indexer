@@ -315,7 +315,8 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
             avg_block_time_sec FLOAT NOT NULL,
             avg_block_size_bytes FLOAT NOT NULL,
             total_block_count INT NOT NULL,
-            new_addresses INT NOT NULL
+            new_addresses INT NOT NULL,
+			total_token_transfers BIGINT
         );
     `)
     if err != nil {
