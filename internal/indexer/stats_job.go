@@ -9,7 +9,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// This is the SQL query you need to run. It calculates all the stats for a single day.
 const dailyNetworkStatsQuery = `
 WITH daily_token_txs AS (
     SELECT
@@ -20,6 +19,43 @@ WITH daily_token_txs AS (
     WHERE tt.token_id IS NULL -- ERC-20 only
       AND tx.timestamp::date = $1::date
     GROUP BY tx.timestamp::date
+),
+daily_active_addresses AS (
+    SELECT
+        timestamp::date AS day,
+        COUNT(DISTINCT address) AS count
+    FROM (
+        SELECT timestamp, from_address AS address FROM transactions
+        WHERE timestamp::date = $1::date
+        UNION
+        SELECT timestamp, to_address AS address FROM transactions
+        WHERE timestamp::date = $1::date AND to_address IS NOT NULL
+    ) AS active_addrs
+    GROUP BY timestamp::date
+),
+daily_active_token_addresses AS (
+    SELECT
+        tx.timestamp::date AS day,
+        COUNT(DISTINCT address) AS count
+    FROM (
+        SELECT tx.timestamp, tt.from_address AS address FROM tokentransactions tt
+        JOIN transactions tx ON tt.tx_hash = tx.tx_hash
+        WHERE tx.timestamp::date = $1::date AND tt.token_id IS NULL
+        UNION
+        SELECT tx.timestamp, tt.to_address AS address FROM tokentransactions tt
+        JOIN transactions tx ON tt.tx_hash = tx.tx_hash
+        WHERE tx.timestamp::date = $1::date AND tt.token_id IS NULL AND tt.to_address IS NOT NULL
+    ) AS active_token_addrs
+    GROUP BY tx.timestamp::date
+),
+daily_fees AS (
+    SELECT
+        timestamp::date AS day,
+        COALESCE(AVG(fee_usd), 0) AS avg_fee_usd,
+        COALESCE(AVG(fee_eth), 0) AS avg_fee_qrl
+    FROM transactions
+    WHERE timestamp::date = $1::date
+    GROUP BY timestamp::date
 )
 INSERT INTO daily_network_stats (
     date,
@@ -28,7 +64,13 @@ INSERT INTO daily_network_stats (
     avg_block_size_bytes,
     total_block_count,
     new_addresses,
-    total_token_transfers
+    total_token_transfers,
+    avg_gas_limit,
+    total_gas_used,
+    active_addresses,
+    active_token_addresses,
+    avg_transaction_fee_usd, -- ADDED
+    avg_transaction_fee_qrl  -- ADDED
     -- avg_difficulty,
     -- hash_rate
 )
@@ -42,7 +84,13 @@ SELECT
     COALESCE(AVG(b.size), 0) AS avg_block_size_bytes,
     COALESCE(COUNT(b.block_number), 0) AS total_block_count,
     COALESCE(a.new_addresses, 0) AS new_addresses,
-    COALESCE(dtt.count, 0) AS total_token_transfers
+    COALESCE(dtt.count, 0) AS total_token_transfers,
+    COALESCE(AVG(b.gas_limit), 0) AS avg_gas_limit,
+    COALESCE(SUM(b.gas_used), 0) AS total_gas_used,
+    COALESCE(daa.count, 0) AS active_addresses,
+    COALESCE(data.count, 0) AS active_token_addresses,
+    COALESCE(df.avg_fee_usd, 0) AS avg_transaction_fee_usd, -- ADDED
+    COALESCE(df.avg_fee_qrl, 0) AS avg_transaction_fee_qrl  -- ADDED
     -- COALESCE(AVG(b.difficulty), 0) AS avg_difficulty,
     -- COALESCE(AVG(b.hash_rate), 0) AS hash_rate
 FROM (
@@ -50,9 +98,9 @@ FROM (
         timestamp::date AS day,
         transaction_count,
         block_number,
-        size
-        -- difficulty,
-        -- hash_rate
+        size,
+        gas_limit,
+        gas_used
     FROM blocks
     WHERE timestamp::date = $1::date
 ) b
@@ -65,14 +113,23 @@ LEFT JOIN (
     GROUP BY day
 ) a ON b.day = a.day
 LEFT JOIN daily_token_txs dtt ON b.day = dtt.day
-GROUP BY b.day, a.new_addresses, dtt.count
+LEFT JOIN daily_active_addresses daa ON b.day = daa.day
+LEFT JOIN daily_active_token_addresses data ON b.day = data.day
+LEFT JOIN daily_fees df ON b.day = df.day -- ADDED THIS JOIN
+GROUP BY b.day, a.new_addresses, dtt.count, daa.count, data.count, df.avg_fee_usd, df.avg_fee_qrl -- ADDED FEE FIELDS
 ON CONFLICT (date) DO UPDATE SET
     total_transactions = EXCLUDED.total_transactions,
     avg_block_time_sec = EXCLUDED.avg_block_time_sec,
     avg_block_size_bytes = EXCLUDED.avg_block_size_bytes,
     total_block_count = EXCLUDED.total_block_count,
     new_addresses = EXCLUDED.new_addresses,
-    total_token_transfers = EXCLUDED.total_token_transfers;
+    total_token_transfers = EXCLUDED.total_token_transfers,
+    avg_gas_limit = EXCLUDED.avg_gas_limit,
+    total_gas_used = EXCLUDED.total_gas_used,
+    active_addresses = EXCLUDED.active_addresses,
+    active_token_addresses = EXCLUDED.active_token_addresses,
+    avg_transaction_fee_usd = EXCLUDED.avg_transaction_fee_usd, -- ADDED
+    avg_transaction_fee_qrl = EXCLUDED.avg_transaction_fee_qrl; -- ADDED
     -- avg_difficulty = EXCLUDED.avg_difficulty,
     -- hash_rate = EXCLUDED.hash_rate;
 `
