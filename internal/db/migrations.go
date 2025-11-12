@@ -292,7 +292,6 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
 		return fmt.Errorf("create token_market_data table: %w", err)
 	}
 
-
 	_, err = tx.Exec(ctx, `
     CREATE TABLE IF NOT EXISTS address_daily_balances (
             address type_address NOT NULL REFERENCES accounts(address) ON DELETE CASCADE,
@@ -302,9 +301,9 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
             PRIMARY KEY (address, date)
         );
     `)
-    if err != nil {
-        return fmt.Errorf("create address_daily_balances table: %w", err)
-    }
+	if err != nil {
+		return fmt.Errorf("create address_daily_balances table: %w", err)
+	}
 
 	_, err = tx.Exec(ctx, `
     CREATE TABLE IF NOT EXISTS daily_network_stats (
@@ -319,49 +318,79 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
 			total_token_transfers BIGINT
         );
     `)
-    if err != nil {
-        return fmt.Errorf("create daily_network_stats table: %w", err)
-    }
+	if err != nil {
+		return fmt.Errorf("create daily_network_stats table: %w", err)
+	}
 
 	_, err = tx.Exec(ctx, `ALTER TABLE daily_network_stats ADD COLUMN IF NOT EXISTS total_token_transfers BIGINT;`)
-    if err != nil {
-        return fmt.Errorf("alter daily_network_stats table add total_token_transfers: %w", err)
-    }
+	if err != nil {
+		return fmt.Errorf("alter daily_network_stats table add total_token_transfers: %w", err)
+	}
 
-    _, err = tx.Exec(ctx, `ALTER TABLE daily_network_stats ADD COLUMN IF NOT EXISTS avg_gas_limit NUMERIC;`)
-    if err != nil {
-        return fmt.Errorf("alter daily_network_stats table add avg_gas_limit: %w", err)
-    }
+	_, err = tx.Exec(ctx, `ALTER TABLE daily_network_stats ADD COLUMN IF NOT EXISTS avg_gas_limit NUMERIC;`)
+	if err != nil {
+		return fmt.Errorf("alter daily_network_stats table add avg_gas_limit: %w", err)
+	}
 
 	_, err = tx.Exec(ctx, `ALTER TABLE daily_network_stats ADD COLUMN IF NOT EXISTS total_gas_used NUMERIC;`)
-    if err != nil {
-        return fmt.Errorf("alter daily_network_stats table add total_gas_used: %w", err)
-    }
+	if err != nil {
+		return fmt.Errorf("alter daily_network_stats table add total_gas_used: %w", err)
+	}
 
 	_, err = tx.Exec(ctx, `ALTER TABLE daily_network_stats ADD COLUMN IF NOT EXISTS active_addresses INT;`)
-    if err != nil {
-        return fmt.Errorf("alter daily_network_stats table add active_addresses: %w", err)
-    }
+	if err != nil {
+		return fmt.Errorf("alter daily_network_stats table add active_addresses: %w", err)
+	}
 
 	_, err = tx.Exec(ctx, `ALTER TABLE daily_network_stats ADD COLUMN IF NOT EXISTS active_token_addresses INT;`)
-    if err != nil {
-        return fmt.Errorf("alter daily_network_stats table add active_token_addresses: %w", err)
-    }
+	if err != nil {
+		return fmt.Errorf("alter daily_network_stats table add active_token_addresses: %w", err)
+	}
 
 	_, err = tx.Exec(ctx, `ALTER TABLE daily_network_stats ADD COLUMN IF NOT EXISTS avg_transaction_fee_usd NUMERIC;`)
-    if err != nil {
-        return fmt.Errorf("alter daily_network_stats table add avg_transaction_fee_usd: %w", err)
-    }
+	if err != nil {
+		return fmt.Errorf("alter daily_network_stats table add avg_transaction_fee_usd: %w", err)
+	}
 
-    _, err = tx.Exec(ctx, `ALTER TABLE daily_network_stats ADD COLUMN IF NOT EXISTS avg_transaction_fee_qrl NUMERIC;`)
-    if err != nil {
-        return fmt.Errorf("alter daily_network_stats table add avg_transaction_fee_qrl: %w", err)
-    }
+	_, err = tx.Exec(ctx, `ALTER TABLE daily_network_stats ADD COLUMN IF NOT EXISTS avg_transaction_fee_qrl NUMERIC;`)
+	if err != nil {
+		return fmt.Errorf("alter daily_network_stats table add avg_transaction_fee_qrl: %w", err)
+	}
 
-    _, err = tx.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_daily_network_stats_date ON daily_network_stats (date);`)
-    if err != nil {
-        return fmt.Errorf("create daily_network_stats index: %w", err)
-    }
+	_, err = tx.Exec(ctx, `ALTER TABLE tokens ADD COLUMN IF NOT EXISTS description TEXT;`)
+	if err != nil {
+		return fmt.Errorf("alter tokens table add description: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `ALTER TABLE tokens ADD COLUMN IF NOT EXISTS ico_start_date TIMESTAMPTZ;`)
+	if err != nil {
+		return fmt.Errorf("alter tokens table add ico_start_date: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `ALTER TABLE tokens ADD COLUMN IF NOT EXISTS ico_end_date TIMESTAMPTZ;`)
+	if err != nil {
+		return fmt.Errorf("alter tokens table add ico_end_date: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `ALTER TABLE tokens ADD COLUMN IF NOT EXISTS ico_price_usd NUMERIC(20, 10);`)
+	if err != nil {
+		return fmt.Errorf("alter tokens table add ico_price_usd: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `ALTER TABLE tokens ADD COLUMN IF NOT EXISTS country VARCHAR(255);`)
+	if err != nil {
+		return fmt.Errorf("alter tokens table add country: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `ALTER TABLE tokens ADD COLUMN IF NOT EXISTS initial_offer_price_usd NUMERIC(20, 10);`)
+	if err != nil {
+		return fmt.Errorf("alter tokens table add initial_offer_price_usd: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_daily_network_stats_date ON daily_network_stats (date);`)
+	if err != nil {
+		return fmt.Errorf("create daily_network_stats index: %w", err)
+	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit transaction: %w", err)
