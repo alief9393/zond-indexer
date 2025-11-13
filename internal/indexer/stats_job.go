@@ -69,8 +69,9 @@ INSERT INTO daily_network_stats (
     total_gas_used,
     active_addresses,
     active_token_addresses,
-    avg_transaction_fee_usd, -- ADDED
-    avg_transaction_fee_qrl  -- ADDED
+    avg_transaction_fee_usd,
+    avg_transaction_fee_qrl,
+    burnt_fees_qrl -- ADDED THIS
     -- avg_difficulty,
     -- hash_rate
 )
@@ -89,8 +90,9 @@ SELECT
     COALESCE(SUM(b.gas_used), 0) AS total_gas_used,
     COALESCE(daa.count, 0) AS active_addresses,
     COALESCE(data.count, 0) AS active_token_addresses,
-    COALESCE(df.avg_fee_usd, 0) AS avg_transaction_fee_usd, -- ADDED
-    COALESCE(df.avg_fee_qrl, 0) AS avg_transaction_fee_qrl  -- ADDED
+    COALESCE(df.avg_fee_usd, 0) AS avg_transaction_fee_usd,
+    COALESCE(df.avg_fee_qrl, 0) AS avg_transaction_fee_qrl,
+    COALESCE(SUM(b.burnt_fees_eth), 0) AS burnt_fees_qrl -- ADDED THIS (burnt_fees_eth is your QRL column)
     -- COALESCE(AVG(b.difficulty), 0) AS avg_difficulty,
     -- COALESCE(AVG(b.hash_rate), 0) AS hash_rate
 FROM (
@@ -100,7 +102,8 @@ FROM (
         block_number,
         size,
         gas_limit,
-        gas_used
+        gas_used,
+        burnt_fees_eth -- Added this
     FROM blocks
     WHERE timestamp::date = $1::date
 ) b
@@ -115,8 +118,8 @@ LEFT JOIN (
 LEFT JOIN daily_token_txs dtt ON b.day = dtt.day
 LEFT JOIN daily_active_addresses daa ON b.day = daa.day
 LEFT JOIN daily_active_token_addresses data ON b.day = data.day
-LEFT JOIN daily_fees df ON b.day = df.day -- ADDED THIS JOIN
-GROUP BY b.day, a.new_addresses, dtt.count, daa.count, data.count, df.avg_fee_usd, df.avg_fee_qrl -- ADDED FEE FIELDS
+LEFT JOIN daily_fees df ON b.day = df.day
+GROUP BY b.day, a.new_addresses, dtt.count, daa.count, data.count, df.avg_fee_usd, df.avg_fee_qrl
 ON CONFLICT (date) DO UPDATE SET
     total_transactions = EXCLUDED.total_transactions,
     avg_block_time_sec = EXCLUDED.avg_block_time_sec,
@@ -128,8 +131,9 @@ ON CONFLICT (date) DO UPDATE SET
     total_gas_used = EXCLUDED.total_gas_used,
     active_addresses = EXCLUDED.active_addresses,
     active_token_addresses = EXCLUDED.active_token_addresses,
-    avg_transaction_fee_usd = EXCLUDED.avg_transaction_fee_usd, -- ADDED
-    avg_transaction_fee_qrl = EXCLUDED.avg_transaction_fee_qrl; -- ADDED
+    avg_transaction_fee_usd = EXCLUDED.avg_transaction_fee_usd,
+    avg_transaction_fee_qrl = EXCLUDED.avg_transaction_fee_qrl,
+    burnt_fees_qrl = EXCLUDED.burnt_fees_qrl; -- ADDED THIS
     -- avg_difficulty = EXCLUDED.avg_difficulty,
     -- hash_rate = EXCLUDED.hash_rate;
 `
@@ -138,12 +142,12 @@ ON CONFLICT (date) DO UPDATE SET
 func runStatsForDay(ctx context.Context, db *pgxpool.Pool, day time.Time) error {
 	dateStr := day.Format("2006-01-02")
 	log.Printf("[StatsJob] Running stats query for %s...", dateStr)
-	
+
 	_, err := db.Exec(ctx, dailyNetworkStatsQuery, dateStr)
 	if err != nil {
 		return fmt.Errorf("failed to execute daily stats query for %s: %w", dateStr, err)
 	}
-	
+
 	log.Printf("[StatsJob] Successfully saved stats for %s.", dateStr)
 	return nil
 }
@@ -151,7 +155,7 @@ func runStatsForDay(ctx context.Context, db *pgxpool.Pool, day time.Time) error 
 // backfillDailyStats checks for any missing days between the last run and yesterday.
 func backfillDailyStats(ctx context.Context, db *pgxpool.Pool) {
 	var lastIndexedDate time.Time
-	
+
 	// Find the last date we have stats for.
 	err := db.QueryRow(ctx, "SELECT COALESCE(MAX(date), '1970-01-01'::date) FROM daily_network_stats").Scan(&lastIndexedDate)
 	if err != nil {
@@ -194,13 +198,13 @@ func RunDailyStatsScheduler(ctx context.Context, db *pgxpool.Pool) {
 		durationUntilMidnight := time.Until(midnight)
 
 		log.Printf("[StatsJob] Next run scheduled for %v (in %v)", midnight, durationUntilMidnight)
-		
+
 		select {
 		case <-ctx.Done():
 			// Context was cancelled, shut down the scheduler.
 			log.Println("[StatsJob] Scheduler shutting down.")
 			return
-		
+
 		case <-time.After(durationUntilMidnight):
 			// It's midnight. Run the stats for "yesterday".
 			yesterday := time.Now().Add(-1 * time.Minute) // 1 minute ago to be safe

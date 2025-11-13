@@ -392,6 +392,16 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
 		return fmt.Errorf("create daily_network_stats index: %w", err)
 	}
 
+	_, err = tx.Exec(ctx, `ALTER TABLE daily_network_stats ADD COLUMN IF NOT EXISTS burnt_fees_qrl NUMERIC;`)
+	if err != nil {
+		return fmt.Errorf("alter daily_network_stats table add burnt_fees_qrl: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `ALTER TABLE address_labels ADD COLUMN IF NOT EXISTS category VARCHAR(100);`)
+	if err != nil {
+		return fmt.Errorf("alter address_labels table add category: %w", err)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit transaction: %w", err)
 	}
