@@ -52,7 +52,8 @@ daily_fees AS (
     SELECT
         timestamp::date AS day,
         COALESCE(AVG(fee_usd), 0) AS avg_fee_usd,
-        COALESCE(AVG(fee_eth), 0) AS avg_fee_qrl
+        COALESCE(AVG(fee_eth), 0) AS avg_fee_qrl,
+        COALESCE(SUM(fee_eth), 0) AS total_fee_qrl -- ADDED THIS
     FROM transactions
     WHERE timestamp::date = $1::date
     GROUP BY timestamp::date
@@ -71,7 +72,8 @@ INSERT INTO daily_network_stats (
     active_token_addresses,
     avg_transaction_fee_usd,
     avg_transaction_fee_qrl,
-    burnt_fees_qrl -- ADDED THIS
+    burnt_fees_qrl,
+    total_transaction_fee_qrl -- ADDED THIS
     -- avg_difficulty,
     -- hash_rate
 )
@@ -92,7 +94,8 @@ SELECT
     COALESCE(data.count, 0) AS active_token_addresses,
     COALESCE(df.avg_fee_usd, 0) AS avg_transaction_fee_usd,
     COALESCE(df.avg_fee_qrl, 0) AS avg_transaction_fee_qrl,
-    COALESCE(SUM(b.burnt_fees_eth), 0) AS burnt_fees_qrl -- ADDED THIS (burnt_fees_eth is your QRL column)
+    COALESCE(SUM(b.burnt_fees_eth), 0) AS burnt_fees_qrl,
+    COALESCE(df.total_fee_qrl, 0) AS total_transaction_fee_qrl -- ADDED THIS
     -- COALESCE(AVG(b.difficulty), 0) AS avg_difficulty,
     -- COALESCE(AVG(b.hash_rate), 0) AS hash_rate
 FROM (
@@ -103,7 +106,7 @@ FROM (
         size,
         gas_limit,
         gas_used,
-        burnt_fees_eth -- Added this
+        burnt_fees_eth
     FROM blocks
     WHERE timestamp::date = $1::date
 ) b
@@ -119,7 +122,7 @@ LEFT JOIN daily_token_txs dtt ON b.day = dtt.day
 LEFT JOIN daily_active_addresses daa ON b.day = daa.day
 LEFT JOIN daily_active_token_addresses data ON b.day = data.day
 LEFT JOIN daily_fees df ON b.day = df.day
-GROUP BY b.day, a.new_addresses, dtt.count, daa.count, data.count, df.avg_fee_usd, df.avg_fee_qrl
+GROUP BY b.day, a.new_addresses, dtt.count, daa.count, data.count, df.avg_fee_usd, df.avg_fee_qrl, df.total_fee_qrl -- ADDED total_fee_qrl
 ON CONFLICT (date) DO UPDATE SET
     total_transactions = EXCLUDED.total_transactions,
     avg_block_time_sec = EXCLUDED.avg_block_time_sec,
@@ -133,7 +136,8 @@ ON CONFLICT (date) DO UPDATE SET
     active_token_addresses = EXCLUDED.active_token_addresses,
     avg_transaction_fee_usd = EXCLUDED.avg_transaction_fee_usd,
     avg_transaction_fee_qrl = EXCLUDED.avg_transaction_fee_qrl,
-    burnt_fees_qrl = EXCLUDED.burnt_fees_qrl; -- ADDED THIS
+    burnt_fees_qrl = EXCLUDED.burnt_fees_qrl,
+    total_transaction_fee_qrl = EXCLUDED.total_transaction_fee_qrl; -- ADDED THIS
     -- avg_difficulty = EXCLUDED.avg_difficulty,
     -- hash_rate = EXCLUDED.hash_rate;
 `

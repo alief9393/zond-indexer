@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/theQRL/go-zond/common"
 	"github.com/theQRL/go-zond/core/types"
+	"github.com/theQRL/go-zond/rlp"
 	"github.com/theQRL/go-zond/rpc"
 	"github.com/theQRL/go-zond/zondclient"
 )
@@ -320,6 +321,22 @@ func insertTransactions(
 			return fmt.Errorf("fetch receipt for tx %s: %w", transaction.Hash().Hex(), err)
 		}
 
+		rawTxBytes, err := rlp.EncodeToBytes(transaction)
+		if err != nil {
+			return fmt.Errorf("failed to rlp encode tx %s: %w", transaction.Hash().Hex(), err)
+		}
+		rawTxHex := "0x" + hex.EncodeToString(rawTxBytes)
+
+		var logsJSON json.RawMessage
+		if receipt.Logs != nil && len(receipt.Logs) > 0 {
+			logsJSON, err = json.Marshal(receipt.Logs)
+			if err != nil {
+				return fmt.Errorf("failed to marshal logs for tx %s: %w", transaction.Hash().Hex(), err)
+			}
+		} else {
+			logsJSON = json.RawMessage("[]")
+		}
+
 		from, err := types.Sender(types.LatestSignerForChainID(transaction.ChainId()), transaction)
 		if err != nil {
 			return fmt.Errorf("get sender for tx %s: %w", transaction.Hash().Hex(), err)
@@ -379,8 +396,8 @@ func insertTransactions(
                 tx_hash, block_number, from_address, to_address, value, gas,
                 gas_price, gas_used, type, chain_id, access_list, max_fee_per_gas,
                 max_priority_fee_per_gas, transaction_index, cumulative_gas_used,
-                is_successful, retrieved_from, is_canonical, timestamp, is_contract, method
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+                is_successful, retrieved_from, is_canonical, timestamp, is_contract, method, logs, raw_tx_hex
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
             ON CONFLICT (tx_hash) DO UPDATE
             SET block_number = EXCLUDED.block_number, from_address = EXCLUDED.from_address,
                 to_address = EXCLUDED.to_address, value = EXCLUDED.value, gas = EXCLUDED.gas,
@@ -389,7 +406,7 @@ func insertTransactions(
                 max_priority_fee_per_gas = EXCLUDED.max_priority_fee_per_gas,
                 transaction_index = EXCLUDED.transaction_index, cumulative_gas_used = EXCLUDED.cumulative_gas_used,
                 is_successful = EXCLUDED.is_successful, retrieved_from = EXCLUDED.retrieved_from,
-                is_canonical = EXCLUDED.is_canonical, timestamp = EXCLUDED.timestamp, is_contract = EXCLUDED.is_contract, method = EXCLUDED.method`,
+                is_canonical = EXCLUDED.is_canonical, timestamp = EXCLUDED.timestamp, is_contract = EXCLUDED.is_contract, method = EXCLUDED.method, logs = EXCLUDED.logs, raw_tx_hex = EXCLUDED.raw_tx_hex`,
 			transaction.Hash().Bytes(),
 			block.Number().Int64(),
 			fromAddrBytes,
@@ -411,6 +428,8 @@ func insertTransactions(
 			time.Unix(int64(block.Time()), 0),
 			isContract,
 			method,
+			logsJSON,
+			rawTxHex,
 		)
 		if err != nil {
 			return fmt.Errorf("insert transaction %s: %w", transaction.Hash().Hex(), err)

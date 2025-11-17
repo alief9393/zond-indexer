@@ -402,6 +402,21 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
 		return fmt.Errorf("alter address_labels table add category: %w", err)
 	}
 
+	_, err = tx.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS logs JSONB;`)
+	if err != nil {
+		return fmt.Errorf("alter transactions table add logs: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS raw_tx_hex TEXT;`)
+	if err != nil {
+		return fmt.Errorf("alter transactions table add raw_tx_hex: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `ALTER TABLE daily_network_stats ADD COLUMN IF NOT EXISTS total_transaction_fee_qrl NUMERIC;`)
+	if err != nil {
+		return fmt.Errorf("alter daily_network_stats table add total_transaction_fee_qrl: %w", err)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit transaction: %w", err)
 	}
