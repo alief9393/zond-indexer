@@ -417,6 +417,11 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
 		return fmt.Errorf("alter daily_network_stats table add total_transaction_fee_qrl: %w", err)
 	}
 
+	_, err = tx.Exec(ctx, `ALTER TABLE daily_network_stats ADD COLUMN IF NOT EXISTS contracts_deployed INT;`)
+	if err != nil {
+		return fmt.Errorf("alter daily_network_stats table add contracts_deployed: %w", err)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit transaction: %w", err)
 	}
