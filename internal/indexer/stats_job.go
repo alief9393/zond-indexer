@@ -16,7 +16,7 @@ WITH daily_token_txs AS (
         COUNT(tt.tx_hash) AS count
     FROM tokentransactions tt
     JOIN transactions tx ON tt.tx_hash = tx.tx_hash
-    WHERE tt.token_id IS NULL
+    WHERE tt.token_id IS NULL -- ERC-20 only
       AND tx.timestamp::date = $1::date
     GROUP BY tx.timestamp::date
 ),
@@ -83,7 +83,8 @@ INSERT INTO daily_network_stats (
     avg_transaction_fee_qrl,
     burnt_fees_qrl,
     total_transaction_fee_qrl,
-    contracts_deployed -- ADDED THIS
+    contracts_deployed,
+    total_block_rewards -- ADDED THIS
 )
 SELECT
     b.day,
@@ -104,7 +105,8 @@ SELECT
     COALESCE(df.avg_fee_qrl, 0) AS avg_transaction_fee_qrl,
     COALESCE(SUM(b.burnt_fees_eth), 0) AS burnt_fees_qrl,
     COALESCE(df.total_fee_qrl, 0) AS total_transaction_fee_qrl,
-    COALESCE(dc.count, 0) AS contracts_deployed -- ADDED THIS
+    COALESCE(dc.count, 0) AS contracts_deployed,
+    COALESCE(SUM(b.reward_eth), 0) AS total_block_rewards -- ADDED THIS
 FROM (
     SELECT
         timestamp::date AS day,
@@ -113,7 +115,8 @@ FROM (
         size,
         gas_limit,
         gas_used,
-        burnt_fees_eth
+        burnt_fees_eth,
+        reward_eth -- Added this (assuming you index reward_eth in blocks table)
     FROM blocks
     WHERE timestamp::date = $1::date
 ) b
@@ -129,7 +132,7 @@ LEFT JOIN daily_token_txs dtt ON b.day = dtt.day
 LEFT JOIN daily_active_addresses daa ON b.day = daa.day
 LEFT JOIN daily_active_token_addresses data ON b.day = data.day
 LEFT JOIN daily_fees df ON b.day = df.day
-LEFT JOIN daily_contracts dc ON b.day = dc.day -- ADDED THIS
+LEFT JOIN daily_contracts dc ON b.day = dc.day
 GROUP BY b.day, a.new_addresses, dtt.count, daa.count, data.count, df.avg_fee_usd, df.avg_fee_qrl, df.total_fee_qrl, dc.count
 ON CONFLICT (date) DO UPDATE SET
     total_transactions = EXCLUDED.total_transactions,
@@ -146,7 +149,8 @@ ON CONFLICT (date) DO UPDATE SET
     avg_transaction_fee_qrl = EXCLUDED.avg_transaction_fee_qrl,
     burnt_fees_qrl = EXCLUDED.burnt_fees_qrl,
     total_transaction_fee_qrl = EXCLUDED.total_transaction_fee_qrl,
-    contracts_deployed = EXCLUDED.contracts_deployed; -- ADDED THIS
+    contracts_deployed = EXCLUDED.contracts_deployed,
+    total_block_rewards = EXCLUDED.total_block_rewards; -- ADDED THIS
 `
 
 // runStatsForDay executes the aggregation query for the given day.
