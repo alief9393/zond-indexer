@@ -16,7 +16,7 @@ WITH daily_token_txs AS (
         COUNT(tt.tx_hash) AS count
     FROM tokentransactions tt
     JOIN transactions tx ON tt.tx_hash = tx.tx_hash
-    WHERE tt.token_id IS NULL -- ERC-20 only
+    WHERE tt.token_id IS NULL
       AND tx.timestamp::date = $1::date
     GROUP BY tx.timestamp::date
 ),
@@ -64,7 +64,7 @@ daily_contracts AS (
         COUNT(*) AS count
     FROM transactions
     WHERE timestamp::date = $1::date
-      AND to_address IS NULL -- Contract Creation
+      AND to_address IS NULL
     GROUP BY timestamp::date
 )
 INSERT INTO daily_network_stats (
@@ -84,7 +84,8 @@ INSERT INTO daily_network_stats (
     burnt_fees_qrl,
     total_transaction_fee_qrl,
     contracts_deployed,
-    total_block_rewards -- ADDED THIS
+    total_block_rewards,
+    hash_rate -- ADDED THIS
 )
 SELECT
     b.day,
@@ -106,7 +107,8 @@ SELECT
     COALESCE(SUM(b.burnt_fees_eth), 0) AS burnt_fees_qrl,
     COALESCE(df.total_fee_qrl, 0) AS total_transaction_fee_qrl,
     COALESCE(dc.count, 0) AS contracts_deployed,
-    COALESCE(SUM(b.reward_eth), 0) AS total_block_rewards -- ADDED THIS
+    COALESCE(SUM(b.reward_eth), 0) AS total_block_rewards,
+    0 AS hash_rate -- ADDED (Placeholder until difficulty is indexed)
 FROM (
     SELECT
         timestamp::date AS day,
@@ -116,7 +118,7 @@ FROM (
         gas_limit,
         gas_used,
         burnt_fees_eth,
-        reward_eth -- Added this (assuming you index reward_eth in blocks table)
+        reward_eth
     FROM blocks
     WHERE timestamp::date = $1::date
 ) b
@@ -150,7 +152,8 @@ ON CONFLICT (date) DO UPDATE SET
     burnt_fees_qrl = EXCLUDED.burnt_fees_qrl,
     total_transaction_fee_qrl = EXCLUDED.total_transaction_fee_qrl,
     contracts_deployed = EXCLUDED.contracts_deployed,
-    total_block_rewards = EXCLUDED.total_block_rewards; -- ADDED THIS
+    total_block_rewards = EXCLUDED.total_block_rewards,
+    hash_rate = EXCLUDED.hash_rate; -- ADDED THIS
 `
 
 // runStatsForDay executes the aggregation query for the given day.

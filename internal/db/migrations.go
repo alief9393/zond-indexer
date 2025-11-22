@@ -427,6 +427,11 @@ func Migrate(db *pgxpool.Pool, dropDatabase bool) error {
 		return fmt.Errorf("alter daily_network_stats table add total_block_rewards: %w", err)
 	}
 
+	_, err = tx.Exec(ctx, `ALTER TABLE daily_network_stats ADD COLUMN IF NOT EXISTS hash_rate NUMERIC;`)
+	if err != nil {
+		return fmt.Errorf("alter daily_network_stats table add hash_rate: %w", err)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit transaction: %w", err)
 	}
